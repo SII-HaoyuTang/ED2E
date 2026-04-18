@@ -1,6 +1,6 @@
 # EDBench PKL 数据集结构说明
 
-数据文件：`src/data/ed_energy_5w/processed/mol_EDthresh0.05_data.pkl`
+数据文件：`data/ed_energy_5w/processed/mol_EDthresh0.05_data.pkl`
 
 ---
 
@@ -9,7 +9,7 @@
 ```python
 import pickle
 
-with open("src/data/ed_energy_5w/processed/mol_EDthresh0.05_data.pkl", "rb") as f:
+with open("data/ed_energy_5w/processed/mol_EDthresh0.05_data.pkl", "rb") as f:
     data = pickle.load(f)
 
 # type: dict，共 47,986 个分子
@@ -135,7 +135,7 @@ atom_batch = [0,0,0,0,0, 1,1,1,1,1,1,1, 2,2,2,2]
 PKL 文件约 9 GB，不在内存中完整加载。`EDBenchPKLDataset` 在首次访问分子时将处理结果保存为：
 
 ```
-src/data/ed_energy_5w/cache/{mol_id}_n{n_per_atom}.pt
+data/ed_energy_5w/cache_fps/{mol_id}_fps{npoint}.pt
 ```
 
 后续 epoch 直接读取缓存，显著加速多轮次训练。
@@ -146,6 +146,6 @@ src/data/ed_energy_5w/cache/{mol_id}_n{n_per_atom}.pt
 
 | 文件 | 说明 |
 |------|------|
-| `src/data/dataset.py` | `EDBenchPKLDataset`、`collate_fn` 实现 |
-| `src/data/clustering.py` | 密度加权 K-Means（`cluster_pointcloud`） |
-| `src/data/cube_parser.py` | Gaussian `.cube` 文件解析（数据预处理阶段使用） |
+| `ed2e/data/dataset.py` | `EDBenchPKLDataset`、`collate_fn` 实现 |
+| `ed2e/data/clustering.py` | 密度加权 K-Means（`cluster_pointcloud`） |
+| `ed2e/data/cube_parser.py` | Gaussian `.cube` 文件解析（数据预处理阶段使用） |

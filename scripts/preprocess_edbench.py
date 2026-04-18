@@ -201,6 +201,7 @@ _s23_local_knn_k:     int   = 12
 _s23_chart_knn_k:     int   = 8
 _s23_num_anchors:     int   = 8
 _s23_threads_per_proc: int  = 4
+_s23_mem_thresh:      Optional[int] = None
 
 
 def _s23_worker(mol_id: str) -> Tuple[str, str, Optional[float], Optional[object]]:
@@ -213,6 +214,7 @@ def _s23_worker(mol_id: str) -> Tuple[str, str, Optional[float], Optional[object
         manifold_levels = _s23_manifold_merged[mol_id]  # type: ignore[index]
         fclc_levels = build_fclc_levels(
             manifold_levels, tau_r=_s23_tau_r, tau_2=_s23_tau_2,
+            mem_thresh=_s23_mem_thresh,
         )
         sample = build_stage3_sample(
             mol_id, manifold_levels, fclc_levels,
@@ -239,13 +241,14 @@ def _run_stage23(
     threads_per_proc: int,
     shard_size: int,
     chunksize: int,
+    mem_thresh: Optional[int] = None,
 ) -> None:
     """Run Stage 2+3 pipeline, write to packed_dir."""
     from ed2e.data.stage3_packed import Stage3ShardedWriter
 
     global _s23_manifold_merged, _s23_tau_r, _s23_tau_2
     global _s23_local_knn_k, _s23_chart_knn_k, _s23_num_anchors
-    global _s23_threads_per_proc
+    global _s23_threads_per_proc, _s23_mem_thresh
 
     _s23_manifold_merged  = manifold_merged
     _s23_tau_r            = tau_r
@@ -254,6 +257,7 @@ def _run_stage23(
     _s23_chart_knn_k      = chart_knn_k
     _s23_num_anchors      = num_anchors
     _s23_threads_per_proc = threads_per_proc
+    _s23_mem_thresh       = mem_thresh
 
     writer = Stage3ShardedWriter(packed_dir, shard_size=shard_size)
     counts:     Dict[str, int] = defaultdict(int)
@@ -358,6 +362,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--local-knn-k", type=int,   default=12)
     p.add_argument("--chart-knn-k", type=int,   default=8)
     p.add_argument("--num-anchors", type=int,   default=8)
+    p.add_argument("--mem-thresh",  type=int,   default=None,
+                   help="Max vertices per manifold component for precomputing the "
+                        "full dense geodesic distance matrix. Eliminates per-Dijkstra "
+                        "fallback and greatly speeds up Stage 2. With 500 GB RAM, "
+                        "15000–20000 is recommended.")
 
     # split
     p.add_argument("--split-col", default="scaffold_split",
@@ -441,6 +450,7 @@ def main() -> None:
             threads_per_proc=args.threads_per_proc,
             shard_size=args.shard_size,
             chunksize=args.chunksize,
+            mem_thresh=args.mem_thresh,
         )
         print(f"[Stage 2+3] Done in {time.perf_counter()-t0:.1f}s")
 

@@ -40,6 +40,7 @@ _g_local_knn_k: int = 12
 _g_chart_knn_k: int = 8
 _g_num_anchors: int = 8
 _g_threads_per_proc: int = 4
+_g_mem_thresh: Optional[int] = None
 
 
 def _worker(mol_id: str) -> Tuple[str, str, Optional[float], Optional[object]]:
@@ -60,7 +61,8 @@ def _worker(mol_id: str) -> Tuple[str, str, Optional[float], Optional[object]]:
                 return mol_id, "error:missing_manifold", None, None
             manifold_levels = load_manifold_levels(path)
 
-        fclc_levels = build_fclc_levels(manifold_levels, tau_r=_g_tau_r, tau_2=_g_tau_2)
+        fclc_levels = build_fclc_levels(manifold_levels, tau_r=_g_tau_r, tau_2=_g_tau_2,
+                                         mem_thresh=_g_mem_thresh)
         sample = build_stage3_sample(
             mol_id,
             manifold_levels,
@@ -122,6 +124,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--local-knn-k", type=int, default=12)
     p.add_argument("--chart-knn-k", type=int, default=8)
     p.add_argument("--num-anchors", type=int, default=8)
+    p.add_argument("--mem-thresh", type=int, default=None,
+                   help="Max mesh vertices per component for precomputing the full "
+                        "dense geodesic distance matrix. Higher values trade RAM for "
+                        "speed (eliminates per-Dijkstra fallback). Default: use "
+                        "ED2E_FCLC_MEM_THRESH env var or module default (3000). "
+                        "With 500 GB RAM, 15000–20000 is safe.")
     p.add_argument("--max-samples", type=int, default=None)
     p.add_argument("--chunksize", type=int, default=4)
     return p.parse_args()
@@ -134,7 +142,7 @@ def main() -> None:
 
     global _g_manifold_cache_dir, _g_manifold_merged, _g_n_levels, _g_smooth_sigma
     global _g_tau_r, _g_tau_2, _g_local_knn_k, _g_chart_knn_k, _g_num_anchors
-    global _g_threads_per_proc
+    global _g_threads_per_proc, _g_mem_thresh
 
     _g_manifold_cache_dir = args.manifold_cache_dir or ""
     _g_manifold_merged    = None
@@ -146,6 +154,7 @@ def main() -> None:
     _g_chart_knn_k        = args.chart_knn_k
     _g_num_anchors        = args.num_anchors
     _g_threads_per_proc   = args.threads_per_proc
+    _g_mem_thresh         = args.mem_thresh
 
     if args.manifold_pkl is not None:
         from ed2e.data.manifold import _patch_legacy_pickle_modules

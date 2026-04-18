@@ -1,26 +1,8 @@
 # Stage 3: FCLC 内聚合与 Stage 4 层内聚合接口
 
-## 当前范围
+## 范围
 
-本阶段实现的是 **Stage 3 local block**，但所有数据组织、缓存格式、运行态输出都按“**下一步立刻进入 Stage 4 intra block**”设计。
-
-当前已经落地的内容：
-
-- Stage 2 -> Stage 3 所需接口升级
-- Stage 3 单分子 flat sample/cache 构建
-- Stage 3 面向训练的 packed mmap cache
-- Stage 3 local block
-- Stage 4 所需静态 bundle 的预构建与零重排消费接口
-- 无 readout 的 smoke forward
-- 数据流检查函数与 CLI
-
-当前明确 **不做**：
-
-- 全局读出
-- 能量头
-- loss
-- 真正的 Stage 4 主传播
-- 后续层间传播
+本文档覆盖 **Stage 3 local block** 的数据结构与缓存格式，以及 Stage 4 所需静态 bundle 的预构建接口。Stage 4 / Stage 5 / Stage 6 详见各自对应文档。
 
 `chart self-update` 本阶段没有作为单独模块存在。原因是这里采用的是：
 
@@ -28,7 +10,7 @@
 2. 用 `\tilde F_a^{local}` 调制 FCLC 内消息传递
 3. 用更新后的 local state 重新编码出下一个 `(\tilde F_a^{local}, p_a)`
 
-也就是说，`T_chart_encode` 已经承担了“下一轮 local / 下一阶段 intra 的 chart state 起点”这一职责，因此不再额外插入一个独立 `chart self-update`。
+也就是说，`T_chart_encode` 已经承担了”下一轮 local / 下一阶段 intra 的 chart state 起点”这一职责，因此不再额外插入一个独立 `chart self-update`。
 
 ---
 
@@ -168,7 +150,7 @@ chart 状态同样是双流，因为从显式结构编码得到的 `\tilde F` �
 
 ## Stage 3 Sample / Cache Schema
 
-单分子 sample 在 [`ed2e/data/stage3_local.py`](/Users/sii-haoyutang/Code/PycharmProjects/ED2E/ed2e/data/stage3_local.py) 中定义为 `Stage3Sample`。
+单分子 sample 在 `ed2e/data/stage3_local.py` 中定义为 `Stage3Sample`。
 
 ### 节点级字段
 
@@ -262,7 +244,7 @@ chart 状态同样是双流，因为从显式结构编码得到的 `\tilde F` �
 - `zip bundle` 还会额外引入 archive member 查找
 - DataLoader 多 worker 时，这条路径的 Python 开销会被反复放大
 
-因此当前已经新增 **packed mmap cache**，定义在 [`ed2e/data/stage3_packed.py`](/Users/sii-haoyutang/Code/PycharmProjects/ED2E/ed2e/data/stage3_packed.py)。
+因此当前已经新增 **packed mmap cache**，定义在 `ed2e/data/stage3_packed.py`。
 
 其设计原则是：
 
