@@ -1,0 +1,2887 @@
+\documentclass[12pt,a4paper]{ctexart}
+
+\usepackage{geometry}
+\geometry{left=2.35cm,right=2.35cm,top=2.5cm,bottom=2.5cm}
+
+\usepackage{amsmath,amssymb,amsfonts,amsthm,bm,mathtools,mathrsfs}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{longtable}
+\usepackage{setspace}
+\usepackage{titlesec}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{float}
+\usepackage{xeCJK}
+
+\setstretch{1.18}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue
+}
+
+\titleformat{\section}{\Large\bfseries}{\thesection}{0.8em}{}
+\titleformat{\subsection}{\large\bfseries}{\thesubsection}{0.8em}{}
+\titleformat{\subsubsection}{\normalsize\bfseries}{\thesubsubsection}{0.8em}{}
+
+\title{\textbf{基于多层等值流形与特征相容局部坐标卡的电子密度层级建模手册}\\
+\large Manual-style Proposal and Technical Design Draft}
+\author{Draft Manual}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+本文整理一套以电子密度场为输入、以多层等值流形与特征相容局部坐标卡（feature-compatible local charts, FCLCs）为中介表示的层级建模框架。该框架的近期目标是依据电子云密度预测分子的各种能量与相关物理量；其更长期目标则是为“从简单流形扩散到复杂等值流形及其面上场”的随机流形生成任务提供统一的目标表示空间。与直接在三维体素或原子图上建模不同，本文方法首先将电子密度场 \(\rho(\mathbf r)\) 转化为一组多层等值流形面，再在每层流形面上构造一组局部几何--物理模式相容的 FCLC atlas，随后在 FCLC 内部、同层 FCLC 图以及相邻层 FCLC 图三个层级上递归进行消息传递。
+
+本文档按“手册”风格组织，而非只给出压缩主文版。我们尽量保留设计动机、算法细节、结构选择理由、保守实现方案与未来扩展接口。特别地，本文档详细解释了：多层阈值如何选取；初始点与初始 FCLC 如何确定；FCLC atlas 如何通过前沿驱动、二点相容函数与区域相容打分逐步生长；当节点同时属于多个 FCLC 时应如何引入全局共享主状态与 FCLC 内局部状态的双状态机制；FCLC 内部的几何块、标量块和向量块如何构造显式结构描述子 \(ES\)，又如何编码为局部调制特征 \(\tilde F\) 并进一步控制局部传播核。后续部分将继续给出层内传播、层间传播、输出头、损失函数、实验计划、附录与符号表。
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%========================================================
+\section{引言：问题背景、总体目标与两阶段任务关系}
+
+\subsection{电子密度为何值得作为主建模对象}
+
+在量子化学与分子建模中，电子密度
+\[
+\rho:\mathbb R^3\to\mathbb R
+\]
+是最核心的连续场之一。它不仅比原子图更细粒度，而且直接携带了局部成键、极化、核心层/价层结构、局部反应性以及有效势相关的信息。相较于只使用原子核位置与元素种类，电子密度具有以下优势：
+
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{连续性：} 它不是离散对象的拼接，而是定义在三维空间中的连续场；
+    \item \textbf{几何性：} 它天然诱导出一族等值面，这些等值面是嵌入于 \(\mathbb R^3\) 中的二维流形面；
+    \item \textbf{物理性：} 它与能量、局部势、轨道分布、局部反应性等物理量具有直接关系；
+    \item \textbf{多尺度性：} 不同密度阈值对应不同电子区域，天然形成“核心层--成键区--外层价层”的分层结构。
+\end{enumerate}
+
+因此，若要寻找一种同时兼顾物理真实性与神经网络可训练性的中介表示，电子密度所诱导出的多层等值流形体系是很自然的候选。
+
+\subsection{现有路线的局限与本文路线的动机}
+
+现有分子机器学习方法大致可分为三类：
+
+\begin{itemize}[leftmargin=2em]
+    \item \textbf{原子图路线：} 用原子为节点、原子间关系为边，再用消息传递神经网络或等变网络学习。优点是高效，缺点是电子分布信息被压缩得过于离散。
+    \item \textbf{体素/网格路线：} 将 \(\rho(\mathbf r)\) 离散成三维网格，用 3D CNN 或相关网络处理。优点是直接，缺点是计算代价高、结构冗余大、局部几何组织不清晰。
+    \item \textbf{点云/表面路线：} 用点云或曲面表示空间分布，试图在几何对象上学习。优点是比体素更轻，缺点是局部图册、跨层关系与连续场诱导结构通常仍缺乏系统设计。
+\end{itemize}
+
+本文采用一条中间路线：
+
+\begin{quote}
+\textbf{不直接在整个体素空间中建模，也不退回到纯原子图，而是先由电子密度诱导出多层等值流形，再在每层流形面上构造特征相容局部坐标卡 FCLC，最后在这套多层 atlas 上进行层级传播。}
+\end{quote}
+
+这种路线试图解决两个根本问题：
+
+\begin{enumerate}[leftmargin=2em]
+    \item 如何让电子密度中的连续几何结构被明确地组织起来；
+    \item 如何让这种几何组织既适合神经网络训练，又为后续生成任务提供统一表示空间。
+\end{enumerate}
+
+\subsection{两阶段任务：判别任务与生成任务的关系}
+
+本文的总体研究计划包含两个彼此衔接的阶段：
+
+\paragraph{第一阶段：判别任务}
+依据电子密度预测分子的各种能量与相关物理量。这里的重点并不只是“训练一个回归器”，而是学习一种由电子密度诱导出的、多层流形与局部图册组成的结构化表示。
+
+\paragraph{第二阶段：生成任务}
+从简单流形出发，通过随机流形扩散或其他生成机制，逐步生成复杂等值流形面以及其上的场。这里的关键不是从零生成任意几何，而是生成落在第一阶段学到的“目标流形表示空间”中的对象。
+
+因此，这两个任务之间的关系不是简单并列，而是：
+
+\begin{quote}
+\textbf{第一阶段定义目标表示空间，第二阶段在该表示空间中进行生成。}
+\end{quote}
+
+换言之，本文第一部分虽然是判别式建模，但其长期价值在于为第二部分提供几何合理、物理可解释、可训练的状态空间。
+
+%========================================================
+\section{相关工作与本文相对位置}
+
+\subsection{基于电子密度的机器学习}
+基于电子密度的机器学习方法表明：电子密度不仅可以作为输入，而且可以成为新的 benchmark 模态，支持预测、检索和生成任务。这些工作说明，电子密度作为分子建模对象是可行且有意义的。但多数方法仍然主要把电子密度看作三维欧氏体素信号，而对其诱导出的等值流形结构利用不足。
+
+\subsection{电子云作为中介潜变量}
+已有生成工作显示，把电子云或电子密度作为中介潜变量可以扩大分子设计空间并提高可解释性。这一点启发我们：电子密度不必只被当作“待处理输入”，也可以作为结构化中介表示。本文进一步将这一中介表示几何化为多层等值流形与 FCLC atlas。
+
+\subsection{显式结构建模思想}
+在三维点云中，显式结构建模的关键思想是：局部结构不应只在隐空间里被吸收，而应在原始空间中先构造成结构描述子，再由其生成共享的动态核或调制器。本文将这一思想推广到流形 chart 内部：不是直接让网络从点集隐式学局部几何，而是先显式构造 \(ES\)，再由 \(ES\) 编码出局部调制特征 \(\tilde F\)。
+
+\subsection{流形学习与局部图册思想}
+流形学习告诉我们：复杂几何对象通常应由一组局部坐标卡来理解，而不是强行压到单一全局坐标中。本文中的 FCLC 正是沿这一思路构造：目标不是将每层流形面均匀切成固定大小 patch，而是寻找一组“局部几何--物理模式相容”的 chart。
+
+\subsection{本文与现有工作的本质区别}
+本文与已有路线相比的根本区别在于：
+
+\begin{enumerate}[leftmargin=2em]
+    \item 输入不是原子图，也不是直接的三维体素，而是电子密度诱导出的多层流形对象；
+    \item 局部结构单位不是固定半径 patch，而是 feature-compatible local chart；
+    \item 传播层级被明确拆为：FCLC 内局部传播、同层 chart 图传播、层间 chart 图传播；
+    \item 局部与层内传播都引入显式结构调制；
+    \item 层间传播以法向投影诱导的方向性对应关系为主干；
+    \item 第一阶段学习的表示不是一次性中间特征，而是第二阶段生成任务的目标空间。
+\end{enumerate}
+
+%========================================================
+\section{问题设定与整体符号体系}
+
+\subsection{基本对象}
+
+设电子密度场为
+\[
+\rho:\mathbb R^3\rightarrow \mathbb R.
+\]
+
+我们的目标是学习一个映射
+\[
+\mathcal F:\rho \mapsto \hat y,
+\]
+其中 \(\hat y\) 可以表示：
+\begin{itemize}[leftmargin=2em]
+    \item 分子总能量；
+    \item 多个能量分量；
+    \item 或其他与电子密度相关的目标物理量。
+\end{itemize}
+
+\subsection{整体表示链}
+
+从电子密度到预测输出，本文方法的整体表示链为
+\[
+\rho
+\;\Longrightarrow\;
+\{M_k\}_{k=1}^{K}
+\;\Longrightarrow\;
+\{P_a^{(k)}\}
+\;\Longrightarrow\;
+\{x_i\}, \{h_i^{(0)}\}
+\;\Longrightarrow\;
+\mathcal B^{L}
+\;\Longrightarrow\;
+\{\hat p_a\}
+\;\Longrightarrow\;
+z
+\;\Longrightarrow\;
+\hat y.
+\]
+
+其中：
+\begin{itemize}[leftmargin=2em]
+    \item \(M_k\) 表示第 \(k\) 层等值流形面；
+    \item \(P_a^{(k)}\) 表示第 \(k\) 层上的第 \(a\) 个 FCLC；
+    \item \(x_i\) 表示离散节点；
+    \item \(h_i^{(0)}\) 表示节点初始状态；
+    \item \(\mathcal B\) 表示一个层级 block；
+    \item \(L\) 表示 block 重复次数；
+    \item \(\hat p_a\) 表示最终用于全局读出的 FCLC 级标量主表示；
+    \item \(z\) 表示全局表示；
+    \item \(\hat y\) 表示输出。
+\end{itemize}
+
+\subsection{固定 block 节奏}
+
+每个标准 block 的结构固定为
+\[
+\boxed{
+\mathcal B
+=
+\mathcal T_{\mathrm{inter}}
+\circ
+\mathcal T_{\mathrm{intra}}
+\circ
+\mathcal R_{\mathrm{chart}}
+\circ
+\mathcal T_{\mathrm{local}}^{\,3}
+}
+\]
+
+即：
+\begin{enumerate}[leftmargin=2em]
+    \item 在每个 FCLC 内做 3 次局部传播；
+    \item 在同层 FCLC 图上做 1 次层内传播；
+    \item 在相邻层之间做 1 次层间传播。
+\end{enumerate}
+
+采用 \(3+1+1\) 而不是更随意的顺序，是为了实现这样一种信息流节奏：
+
+\begin{quote}
+先提纯局部，再组织同层，再耦合层间；随后新的 chart 状态再反向影响其内部节点，进入下一轮局部传播。
+\end{quote}
+
+这与我们此前讨论过的“代议制民主”式传播有相似直觉：节点先在本地汇聚意见，再由 chart 代表去同层与层间交流，交流结果再回灌局部节点。
+
+%========================================================
+\section{网络输入对象、节点定义与节点特征}
+
+\subsection{原始输入与主网络输入的区分}
+
+从最原始的层面看，模型输入是
+\[
+\rho(\mathbf r)
+\]
+以及必要的分子元信息，例如：
+\begin{itemize}[leftmargin=2em]
+    \item 原子核坐标；
+    \item 元素类型；
+    \item 总电荷；
+    \item 自旋多重度；
+    \item 必要时还包括所用电子结构计算设置。
+\end{itemize}
+
+但从主网络来看，真正进入层级传播模块的不是连续场 \(\rho\) 本身，而是由预处理模块从 \(\rho\) 中诱导出的结构化对象：
+\[
+\Big(
+\{M_k\}_{k=1}^{K},
+\ \{P_a^{(k)}\},
+\ \{x_i\},
+\ \{h_i^{(0)}\},
+\ \{\tilde w_{a\leftarrow b}\}
+\Big).
+\]
+
+因此，输入可分为两层：
+
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{原始输入层：}
+    \[
+    \rho(\mathbf r),\ \text{分子元信息}
+    \]
+    \item \textbf{结构化输入层：}
+    \[
+    \{M_k\},\ \{P_a^{(k)}\},\ \{x_i\},\ \{h_i^{(0)}\},\ \{\tilde w_{a\leftarrow b}\}.
+    \]
+\end{enumerate}
+
+\subsection{节点的定义}
+
+本文中的节点不是原子，也不是三维体素，而是\textbf{等值流形面上的离散采样点}。也就是说，在每个等值流形层
+\[
+M_k=\{x\in\mathbb R^3:\rho(x)=c_k\}
+\]
+上进行离散采样或 mesh 化后，得到节点集合
+\[
+\{x_i\}\subset M_k.
+\]
+
+每个节点 \(x_i\) 既是三维空间中的点，也是流形面上的采样点。因此它天然携带三类信息：
+\begin{enumerate}[leftmargin=2em]
+    \item 三维空间位置；
+    \item 曲面局部几何信息；
+    \item 由电子密度场诱导的局部物理场信息。
+\end{enumerate}
+
+\subsection{节点上的几何性质}
+
+对每个节点 \(x_i\)，最基础的几何对象为
+\[
+x_i,\qquad n_i,\qquad H_i,\qquad K_i,
+\]
+其中：
+\begin{itemize}[leftmargin=2em]
+    \item \(x_i\in\mathbb R^3\) 为节点三维坐标；
+    \item \(n_i\) 为节点法向；
+    \item \(H_i\) 为平均曲率；
+    \item \(K_i\) 为高斯曲率。
+\end{itemize}
+
+后续还可扩展到：
+\begin{itemize}[leftmargin=2em]
+    \item 主曲率 \((\kappa_{1,i},\kappa_{2,i})\)；
+    \item 局部面积权重；
+    \item shape operator 的局部不变量；
+    \item 切平面上的 Hessian 投影与更高阶几何张量。
+\end{itemize}
+但在第一版中，我们不将这些复杂对象全部纳入主输入。
+
+\subsection{节点上的标量性质：保守方案}
+
+在第一版保守实现中，我们取节点初始标量特征为
+\[
+h_i^{s,(0)}
+=
+\Big(
+\|\nabla\rho\|_i,\
+\Delta\rho_i,\
+H_i,\
+K_i,\
+\partial_n^2\rho_i
+\Big).
+\]
+
+其中：
+\begin{itemize}[leftmargin=2em]
+    \item \(\|\nabla\rho\|_i\) 表示电子密度梯度强度；
+    \item \(\Delta\rho_i\) 表示电子密度 Laplacian；
+    \item \(H_i,K_i\) 将局部几何信息作为标量量并入；
+    \item \(\partial_n^2\rho_i\) 表示沿法向的二阶导，反映层间厚度与法向变化趋势。
+\end{itemize}
+
+这五类量不是随意拼接出来的，而是来自我们此前对“面上场的量”与“第一版保守方案”的反复讨论。它们的角色分别是：
+
+\begin{enumerate}[leftmargin=2em]
+    \item \(\|\nabla\rho\|\)：反映局部密度变化强弱；
+    \item \(\Delta\rho\)：反映局部凸凹、聚集与耗散趋势；
+    \item \(H,K\)：反映局部曲面几何；
+    \item \(\partial_n^2\rho\)：为层间关系与厚度趋势提供法向变化信息。
+\end{enumerate}
+
+\subsection{节点上的向量性质：保守方案}
+
+虽然很多基本物理量本身是标量场，但在流形面上它们可以自然诱导出切向量场。本文的一个基本思想是：网络从一开始就应显式区分标量型与向量型信息，而不是把方向性完全隐式吸收掉。
+
+在第一版保守方案中，仅保留两个切向量场：
+\[
+h_i^{v,(0)}
+=
+\Big(
+\nabla_M \|\nabla\rho\|_i,\
+\nabla_M H_i
+\Big),
+\]
+其中：
+\begin{itemize}[leftmargin=2em]
+    \item \(\nabla_M \|\nabla\rho\|_i\) 反映电子密度梯度强度在流形面上的变化方向；
+    \item \(\nabla_M H_i\) 反映平均曲率在流形面上的变化方向。
+\end{itemize}
+
+之所以选择这两个，而不是把所有标量场都变成切向量场，是因为：
+\begin{enumerate}[leftmargin=2em]
+    \item 它们分别代表“物理变化方向”和“几何变化方向”；
+    \item 数量少，便于第一版实现与训练稳定；
+    \item 足以先验证“标量场诱导切向量场”这一核心路线。
+\end{enumerate}
+
+\subsection{节点初始状态}
+
+综上，节点初始状态写为
+\[
+h_i^{(0)}
+=
+\big(
+h_i^{s,(0)},\ h_i^{v,(0)}
+\big),
+\]
+即
+\[
+h_i^{(0)}
+=
+\Big(
+\underbrace{
+\|\nabla\rho\|_i,\
+\Delta\rho_i,\
+H_i,\
+K_i,\
+\partial_n^2\rho_i
+}_{\text{标量通道}},
+\quad
+\underbrace{
+\nabla_M \|\nabla\rho\|_i,\
+\nabla_M H_i
+}_{\text{向量通道}}
+\Big).
+\]
+
+\subsection{为何称为“保守方案”}
+
+称其为保守方案，是因为它刻意做了三点收缩：
+\begin{enumerate}[leftmargin=2em]
+    \item 不在第一版中纳入过多高阶或专门的电子结构量；
+    \item 向量通道只保留两个最核心的切向量场；
+    \item 先聚焦于“多层流形 + FCLC + 层级传播”主框架本身，而非把输入端做得过重。
+\end{enumerate}
+
+\subsection{后续扩展方向}
+
+节点输入后续可扩展为：
+\begin{itemize}[leftmargin=2em]
+    \item \textbf{标量量扩展：} ELF、局域动能密度、交换相关相关局部标量、更高阶法向/切向导数不变量、AIM/Bader 风格局部拓扑指标；
+    \item \textbf{向量量扩展：}
+    \[
+    \nabla_M \Delta\rho,\qquad
+    \nabla_M K,\qquad
+    \nabla_M \partial_n^2\rho
+    \]
+    等；
+    \item \textbf{更高阶对象扩展：} 切平面二阶张量、面内 Hessian、shape operator 的张量表达、向量丛或张量丛的更一般截面。
+\end{itemize}
+
+%========================================================
+\section{多层等值流形面的构造与阈值策略}
+
+\subsection{多层等值流形的定义}
+
+选取一组阈值
+\[
+c_1,c_2,\dots,c_K,
+\]
+定义第 \(k\) 层等值流形面
+\[
+M_k=\{x\in\mathbb R^3:\rho(x)=c_k\}.
+\]
+进一步将其分解为连通分量
+\[
+M_k=\bigsqcup_{\ell=1}^{L_k}M_{k,\ell}.
+\]
+
+后续所有 FCLC atlas 的生长、局部坐标系建立以及层级传播，均在每个连通分量上独立进行。
+
+\subsection{为何需要多层，而不是单层}
+
+我们此前反复讨论过，多层等值流形的作用不是“多切几层图形看看”，而是为不同电子区域建立结构化分工。直观上：
+
+\begin{itemize}[leftmargin=2em]
+    \item 高密度层对应更接近核心电子区域；
+    \item 中密度层更偏向成键与局部结构核心区；
+    \item 低密度层更偏向价层与外围电子分布。
+\end{itemize}
+
+因此，多层表示的作用在于让不同物理区域、不同几何复杂度的结构分别出现在不同层级中，而不是把所有信息都堆在同一张面上。
+
+\subsection{混合阈值策略}
+
+我们最终采用的不是简单均匀阈值，而是“混合阈值策略”。其基本思路是：
+
+\begin{enumerate}[leftmargin=2em]
+    \item 对核心层与价层采用不同的阈值密度分配逻辑；
+    \item 使高密度层数量与低密度层数量不必完全均衡；
+    \item 让多层结构对应明确的物理角色，而非纯数值分层。
+\end{enumerate}
+
+在第一版实现中，具体阈值集合可按“物理启发 + 小规模验证”的方式确定；后续实验中将其作为可消融超参数，比较：
+\begin{itemize}[leftmargin=2em]
+    \item 单一均匀阈值策略；
+    \item 混合阈值策略；
+    \item 不同层数 \(K\) 的影响。
+\end{itemize}
+
+\subsection{等值面离散提取}
+
+本文默认由离散电子密度场直接提取等值面。实现上可采用：
+\begin{itemize}[leftmargin=2em]
+    \item marching cubes（第一版主方案）；
+    \item 或其他标准等值面提取方法。
+\end{itemize}
+
+这里要明确一点：我们此前讨论过“marching cubes 还是原子中心高斯函数构面”的问题，最终决定为：
+
+\begin{quote}
+\textbf{主几何定义应来自电子密度场本身的等值面提取；原子中心高斯类方法至多作为平滑或辅助近似，而不取代真实密度场所定义的几何对象。}
+\end{quote}
+
+%========================================================
+\section{FCLC Atlas 的构造：从初始点到完整图册}
+
+\subsection{FCLC 的目标与设计原则}
+
+在本文中，FCLC（feature-compatible local chart）的目标不是把流形面切成一堆大小差不多的 patch，而是寻找一组\textbf{局部几何--物理模式相容}的局部坐标卡。也就是说，我们真正寻找的是一组“相容坐标卡集”，而不是“固定半径 patch 集”。
+
+因此，允许出现如下情况：
+\begin{itemize}[leftmargin=2em]
+    \item 某些 chart 很小，但局部变化剧烈且具有代表性；
+    \item 某些 chart 很大，但内部特征高度相似；
+    \item chart 之间存在适度重叠；
+    \item chart 所含节点数不一致。
+\end{itemize}
+
+\subsection{初始点的选择}
+
+在每个连通分量 \(M_{k,\ell}\) 上，先选择一个主种子点
+\[
+c_1.
+\]
+
+这一步不采用随机选点，而使用更稳定的中心型规则，例如 geodesic medoid 或其近似版本。我们此前之所以坚持这样做，是因为主种子点承担三重作用：
+
+\begin{enumerate}[leftmargin=2em]
+    \item 作为该连通分量 atlas 生长的初始点；
+    \item 作为初始参考 chart 的中心；
+    \item 为后续层内参考 FCLC 体系提供锚点。
+\end{enumerate}
+
+\subsection{初始 FCLC 的生成}
+
+有了初始种子点 \(c_1\) 之后，第一个 FCLC 不是通过固定半径球邻域直接截取，而是由\textbf{区域相容打分}决定。
+
+对候选区域 \(P\) 中任意点 \(q\)，定义区域相容打分
+\[
+S_R(q;P)
+=
+\lambda_g\,\tilde r_g(q;P)
++
+\lambda_s\,\tilde r_s(q;P)
++
+\lambda_r\,\tilde r_r(q;P),
+\]
+其中：
+\begin{itemize}[leftmargin=2em]
+    \item \(\tilde r_g\) 衡量几何一致性；
+    \item \(\tilde r_s\) 衡量标量场一致性；
+    \item \(\tilde r_r\) 衡量局部关系签名一致性。
+\end{itemize}
+
+由此定义第一个 FCLC：
+\[
+P_1=\mathrm{Chart}(c_1;S_R).
+\]
+
+这一点很重要，因为它意味着：
+
+\begin{quote}
+\textbf{初始 FCLC 不是人为指定半径，而是由局部相容性定义出来。}
+\end{quote}
+
+\subsection{已覆盖区域与前沿边缘点}
+
+若当前已经生成了 \(t\) 个 FCLC，则已覆盖区域为
+\[
+\Omega_t=\bigcup_{i=1}^{t}P_i.
+\]
+
+当前前沿边缘点集定义为
+\[
+\mathcal F_t=
+\{x\in\partial\Omega_t:\exists y\in\mathcal N(x),\ y\notin\Omega_t\}.
+\]
+
+这里 \(\partial\Omega_t\) 的离散实现可理解为当前 chart 覆盖区域的边界节点集合。我们此前专门讨论过：新 chart 的扩展应该从\textbf{当前前沿边缘点}触发，而不是从旧 chart 的种子中心继续长，这也是算法中“前沿”这一概念的核心意义。
+
+\subsection{边缘点打分：未覆盖度、推进潜力与局部相容稳定度}
+
+对于每个边缘点 \(b\in\mathcal F_t\)，定义前沿打分
+\[
+S_{\mathrm{frontier}}(b)
+=
+\lambda_U U(b)
++
+\lambda_D D(b)
++
+\lambda_C C(b).
+\]
+
+其中：
+
+\paragraph{1. 未覆盖度 \(U(b)\)}
+用来衡量边缘点 \(b\) 周围还有多少局部区域未被 atlas 覆盖。可写成
+\[
+U(b)
+=
+\frac{
+\sum_{q\in N_r(b)\setminus\Omega_t} a(q)
+}{
+\sum_{q\in N_r(b)} a(q)
+},
+\]
+其中 \(a(q)\) 表示节点权重或面积权重，\(N_r(b)\) 为 \(b\) 的局部邻域。
+
+\paragraph{2. 推进潜力 \(D(b)\)}
+用来衡量该点相对于其父 chart 是否朝向“外侧”推进。可定义为
+\[
+D(b)
+=
+\frac{
+d_M\big(b,c_{\mathrm{par}}(b)\big)
+}{
+R\big(P_{\mathrm{par}}(b)\big)+\varepsilon
+},
+\]
+其中 \(c_{\mathrm{par}}(b)\) 表示边缘点所属父 chart 的中心，\(R(P_{\mathrm{par}}(b))\) 表示该父 chart 的特征尺度。
+
+\paragraph{3. 局部相容稳定度 \(C(b)\)}
+它反映该点局部环境是否适合作为新 chart 生长前沿。我们此前讨论过：未覆盖度和推进潜力主要由几何量决定，而局部相容稳定度应和局部 PAC（patch-aware compatibility）相关。第一版可写为
+\[
+C(b)=\exp(-\mathrm{PAC}(b)),
+\]
+并进一步分解为
+\[
+\mathrm{PAC}(b)
+=
+\mu_g\,\mathrm{PAC}_g(b)
++
+\mu_s\,\mathrm{PAC}_s(b)
++
+\mu_r\,\mathrm{PAC}_r(b).
+\]
+
+\subsection{二点对称打分函数}
+
+选定边缘点 \(b\) 后，我们不是直接为它选择一个新中心，而是先用一个\textbf{对称二点打分函数}得到由 \(b\) 诱导出的参考邻域。
+
+定义
+\[
+S_2(p,q)=S_2(q,p).
+\]
+第一版中可取
+\[
+S_2(p,q)
+=
+w_d\,\tilde s_d(p,q)
++
+w_n\,\tilde s_n(p,q)
++
+w_f\,\tilde s_f(p,q),
+\]
+其中
+\[
+\tilde s_d(p,q)=\frac{d_M(p,q)}{\sigma_d+\varepsilon},
+\qquad
+\tilde s_n(p,q)=1-n(p)\cdot n(q),
+\]
+\[
+\tilde s_f(p,q)=\|\hat f(p)-\hat f(q)\|_2.
+\]
+这里 \(\hat f(\cdot)\) 是点级局部关系签名，可由标准化后的局部几何--物理量组成，例如
+\[
+\hat f(x)
+=
+\Big(
+\widehat{\|\nabla\rho\|}(x),\
+\hat K(x),\
+\widehat{\partial_n^2\rho}(x)
+\Big).
+\]
+
+\subsection{参考邻域与外向候选集}
+
+由边缘点 \(b\) 的二点打分定义参考邻域
+\[
+N_2(b)=\{q\in M_{k,\ell}:S_2(b,q)\le \tau_2\}.
+\]
+再去除当前已覆盖区域，得到外向候选发起点集
+\[
+E_b=N_2(b)\setminus\Omega_t.
+\]
+
+这里必须明确一件事，这也是我们对话中反复纠正的关键点：
+
+\begin{quote}
+\textbf{\(N_2(b)\) 只是由边缘点 \(b\) 诱导出的参考邻域，不是最终新 FCLC 的包含上界。}
+\end{quote}
+
+也就是说，最终候选 chart \(P(e)\) 不要求包含于 \(N_2(b)\) 中；\(N_2(b)\) 只是用来给出“从当前前沿向外发起新 chart 的候选区域”。
+
+\subsection{区域相容打分 \(S_R\)}
+
+对于每个候选发起点 \(e\in E_b\)，真正的候选 FCLC 不是由球邻域定义，而是由\textbf{区域相容打分}决定。
+
+设候选区域为 \(P\)，对其中任意点 \(q\)，定义
+\[
+S_R(q;P)
+=
+\lambda_g\,\tilde r_g(q;P)
++
+\lambda_s\,\tilde r_s(q;P)
++
+\lambda_r\,\tilde r_r(q;P).
+\]
+
+其中：
+\[
+\tilde r_g(q;P)
+=
+\alpha_d r_{g,d}(q;P)
++
+\alpha_n r_{g,n}(q;P)
++
+\alpha_\kappa r_{g,\kappa}(q;P),
+\]
+例如可取
+\[
+r_{g,d}(q;P)=\frac{d_M(q,c_P)}{\sigma_d+\varepsilon},
+\qquad
+r_{g,n}(q;P)=1-n(q)\cdot \bar n(P),
+\]
+\[
+r_{g,\kappa}(q;P)=
+|\hat H(q)-\overline{\hat H}(P)|
++
+|\hat K(q)-\overline{\hat K}(P)|.
+\]
+
+标量一致性项可取
+\[
+\tilde r_s(q;P)=
+\|\hat u_s(q)-\overline{\hat u_s}(P)\|_2,
+\]
+关系一致性项可取
+\[
+\tilde r_r(q;P)=
+\|\hat s(q)-\overline{\hat s}(P)\|_2.
+\]
+
+于是，对于每个 \(e\in E_b\)，由 \(S_R\) 生成候选 chart：
+\[
+P(e)=\mathrm{Chart}(e;S_R).
+\]
+
+\subsection{候选 FCLC 质量函数 \(Q(e)\)}
+
+对每个候选 chart \(P(e)\)，定义其质量分数
+\[
+Q(e)
+=
+\alpha_U U_P(e)
++
+\alpha_D D_P(e)
++
+\alpha_C C_P(e)
+-
+\alpha_F L_{\mathrm{front}}(P(e)).
+\]
+
+其中：
+
+\paragraph{1. 新增覆盖度}
+\[
+U_P(e)=\frac{|P(e)\setminus\Omega_t|}{|P(e)|}.
+\]
+
+\paragraph{2. 区域级推进潜力}
+它衡量该候选 chart 是否真正向当前未覆盖区域扩展。
+
+\paragraph{3. 区域内部稳定度}
+\[
+C_P(e)=
+\exp\!\left(
+-\frac1{|P(e)|}\sum_{q\in P(e)}S_R(q;P(e))
+\right).
+\]
+
+\paragraph{4. 前沿关联代价}
+\[
+L_{\mathrm{front}}(P(e))
+=
+\frac{1}{\frac{|P(e)\cap\Omega_t|}{|P(e)|}+\varepsilon}.
+\]
+
+这个量的设计直接来自我们此前的明确要求：
+
+\begin{quote}
+\textbf{当一个候选 FCLC 与旧前沿完全没有重叠时，前沿关联代价应趋于很大；重叠越充分，该代价越小。}
+\end{quote}
+
+因此，这个定义并不是随意选的，而是为了保证新 chart 虽向外扩展，但不能完全脱离已有前沿。
+
+最终，对每个边缘点 \(b\)，可在 \(E_b\) 中选取
+\[
+e_b^\star=\arg\max_{e\in E_b}Q(e),
+\]
+再在所有边缘点诱导出的候选中选择全局最优的一项加入 atlas。重复该过程，直到整个连通分量被一组 FCLC 覆盖。
+
+\subsection{为什么要允许 chart 重叠}
+
+我们明确允许 FCLC 之间存在适度重叠，原因有三：
+
+\begin{enumerate}[leftmargin=2em]
+    \item atlas 的本质是局部图册，而不是互斥分区；
+    \item 重叠区天然提供了同层 chart 之间的桥梁；
+    \item 后续层内 overlap-context 修正正是依赖两个 FCLC 的共享节点来构造。
+\end{enumerate}
+
+因此，“适度重叠”不是一个容错设计，而是整个层内传播机制的一部分。
+
+%========================================================
+\section{FCLC 的局部参考系、四块划分与 anchor 逻辑}
+
+\subsection{局部参考系的建立}
+
+对每个 FCLC \(P_a\)，其中心点为 \(c_a\)，中心法向为 \(n_a\)。对于其中任意点 \(x_{a,i}\in P_a\)，先定义中心切平面坐标
+\[
+u_{a,i}
+=
+\big(
+\langle x_{a,i}-c_a,e_{a,1}\rangle,\
+\langle x_{a,i}-c_a,e_{a,2}\rangle
+\big),
+\]
+其中局部 frame \((e_{a,1},e_{a,2})\) 由中心切平面上的局部 PCA 给出，并满足
+\[
+e_{a,2}=n_a\times e_{a,1}.
+\]
+
+这里需要再次强调此前讨论过的一个区分：
+
+\begin{quote}
+\textbf{FCLC 的中心点决定的是局部几何参考系与结构组织方式，而不是 FCLC 整体特征本身。}
+\end{quote}
+
+也就是说，中心点不代表整个 chart 的状态；它只决定“这个 chart 的坐标系统怎么建”。
+
+\subsection{四块划分}
+
+在局部 frame 下，我们将 FCLC 内部划分为四个几何块：
+\[
+Q_{a,1},\ Q_{a,2},\ Q_{a,3},\ Q_{a,4}.
+\]
+
+之所以采用四块，是因为我们此前已经决定：几何块采用二维笛卡尔局部结构，而不是三维体素式八块分区。它对应二维流形局部 chart 中最自然的显式方向划分，与我们从 X-3D 中借鉴“显式结构分区”思想、但将其适配到二维流形面的设计是一致的。
+
+\subsection{每层 reference FCLC 与 anchor 逻辑}
+
+我们此前讨论过：不采用“把整个不规则流形强行映到单位球再参数化”的主方案，而采用每层一个 reference FCLC 的方式建立层内半全局坐标体系。
+
+设第 \(k\) 层的参考 FCLC 为
+\[
+P_0^{(k)}.
+\]
+
+它的选取与初始 geodesic medoid 种子、主 chart 体系相呼应，各层都遵循同一规则。这样做的好处是：
+
+\begin{enumerate}[leftmargin=2em]
+    \item 避免全局球面参数化在复杂拓扑下带来的不稳定性；
+    \item 让层内全局显式结构仍保持“有中心”的范式；
+    \item 与 FCLC 内部显式结构的中心化建模保持统一。
+\end{enumerate}
+
+%========================================================
+\section{重叠节点的双状态表示机制}
+
+\subsection{问题的提出}
+
+由于 FCLC atlas 允许适度重叠，一个物理节点 \(x_i\) 可能同时属于多个 FCLC：
+\[
+x_i\in P_{a_1}\cap P_{a_2}\cap\cdots\cap P_{a_m}.
+\]
+
+这时会出现一个核心问题：
+
+\begin{quote}
+\textbf{这个节点到底有没有唯一状态？如果有，它如何在多个 chart 内参与局部传播？如果没有，又如何维持同一物理点的一致身份？}
+\end{quote}
+
+单纯采用“全局唯一状态”会丢失节点在不同 chart 中的不同局部角色；单纯采用“每个 chart 内完全复制独立状态”则会破坏节点的一致身份，并导致状态漂移。因此，我们采用双状态机制。
+
+\subsection{全局共享主状态与局部状态}
+
+对每个物理节点 \(x_i\)，维护一个\textbf{全局共享主状态}
+\[
+h_i^{(t)}.
+\]
+
+同时，对每个包含该节点的 FCLC \(P_a\)，再派生一个\textbf{FCLC 内局部状态}
+\[
+\tilde h_{a,i}^{(t)},
+\qquad a\in\mathcal A(i),
+\]
+其中
+\[
+\mathcal A(i)=\{a:\ x_i\in P_a\}.
+\]
+
+这样：
+\begin{itemize}[leftmargin=2em]
+    \item \(h_i^{(t)}\) 负责维持节点在整个网络中的统一身份；
+    \item \(\tilde h_{a,i}^{(t)}\) 负责表达该节点在具体 chart 中的局部上下文角色。
+\end{itemize}
+
+\subsection{局部状态初始化}
+
+在第 \(t\) 个 block 开始时，对每个节点 \(x_i\) 及其所属 FCLC \(P_a\)，由全局主状态初始化局部状态：
+\[
+\tilde h_{a,i}^{(t,0)}
+=
+\Psi_{\mathrm{init}}
+\big(
+h_i^{(t)},
+e_{a,i}^{\mathrm{loc}},
+p_a^{(t)}
+\big),
+\qquad a\in\mathcal A(i),
+\]
+其中 \(e_{a,i}^{\mathrm{loc}}\) 表示节点在 FCLC \(P_a\) 中的局部几何描述，包括：
+\begin{itemize}[leftmargin=2em]
+    \item 相对中心坐标；
+    \item 所属局部块编号；
+    \item 在局部 frame 下的投影表达；
+    \item 可能还包括相对法向偏移等。
+\end{itemize}
+
+在最简实现中，也可以先取
+\[
+\tilde h_{a,i}^{(t,0)} = h_i^{(t)}
+\]
+并将 \(e_{a,i}^{\mathrm{loc}}\) 作为局部消息函数的额外输入。但从方法完整性上，本文采用上面的更一般形式。
+
+\subsection{局部状态回写到全局主状态}
+
+完成 FCLC 内部局部传播后，同一个物理节点 \(x_i\) 在不同 chart 中会有多个局部状态
+\[
+\{\tilde h_{a,i}^{(t,3)}:a\in\mathcal A(i)\}.
+\]
+
+我们引入基于区域相容性的隶属权重
+\[
+\omega_{a,i}
+=
+\frac{
+\exp\big(-\tau_\omega S_R(x_i;P_a)\big)
+}{
+\sum_{b\in\mathcal A(i)}
+\exp\big(-\tau_\omega S_R(x_i;P_b)\big)
+},
+\qquad
+\sum_{a\in\mathcal A(i)}\omega_{a,i}=1.
+\]
+
+然后定义聚合状态
+\[
+h_i^{(t,\mathrm{agg})}
+=
+\sum_{a\in\mathcal A(i)}
+\omega_{a,i}\tilde h_{a,i}^{(t,3)}.
+\]
+
+最终通过残差形式更新全局主状态：
+\[
+h_i^{(t+1,0)}
+=
+h_i^{(t)}
++
+\Psi_{\mathrm{merge}}
+\big(
+h_i^{(t)},
+h_i^{(t,\mathrm{agg})}
+\big).
+\]
+
+这一机制的含义非常直接：如果某个节点在某个 FCLC 中更“相容”，那么该 FCLC 对该节点的新状态应拥有更强解释权；如果该节点只是位于某个 chart 的边缘重叠区，则该 chart 对其回写权重应更小。
+
+\subsection{一个尚保留为扩展项的问题}
+
+我们此前还讨论过：在 FCLC 再编码时，是否也应使用相同的 \(\omega_{a,i}\) 对重叠节点的贡献做加权，以防共享节点被多个 chart 过度重复计入。
+
+这一点在第一版中先不作为硬要求，但在附录中将其保留为增强方向。
+
+%========================================================
+\section{FCLC 内部显式结构描述子 \(ES\) 的详细构造}
+
+\subsection{为什么 FCLC 内部需要显式结构描述子}
+
+FCLC 内传播并不应只是普通的“局部邻域消息传递”。我们此前已经明确决定，局部 chart 内部的结构要尽量显式地表达出来，再由它生成局部传播的调制特征。
+
+因此，对每个 FCLC \(P_a\)，定义其内部显式结构描述子
+\[
+ES_a^{\mathrm{local}}
+=
+\big[
+ES_{a,\mathrm{geom}}^{\mathrm{local}},
+ES_{a,\mathrm{scalar}}^{\mathrm{local}},
+ES_{a,\mathrm{vector}}^{\mathrm{local}}
+\big].
+\]
+
+这里的原则是：
+
+\begin{quote}
+\textbf{FCLC 内的显式结构不能只包含几何块，而必须同时包含几何块、标量块与向量块。}
+\end{quote}
+
+\subsection{几何块的组成}
+
+几何块回答的问题是：\emph{该 FCLC 在纯几何上是什么样的局部区域？}
+
+对每个局部块 \(Q_{a,c}\), \(c=1,2,3,4\)，定义其节点数
+\[
+N_{a,c}=|Q_{a,c}|,
+\qquad
+r_{a,c}^{\mathrm{occ}}=\frac{N_{a,c}}{\sum_{d=1}^{4}N_{a,d}}.
+\]
+
+若有离散面积权重 \(A(x_{a,i})\)，定义面积比例
+\[
+A_{a,c}=\sum_{x_{a,i}\in Q_{a,c}}A(x_{a,i}),
+\qquad
+r_{a,c}^{\mathrm{area}}=\frac{A_{a,c}}{\sum_{d=1}^{4}A_{a,d}}.
+\]
+
+定义几何质心
+\[
+\mu_{a,c}^{\mathrm{geom}}
+=
+\frac{1}{N_{a,c}}
+\sum_{x_{a,i}\in Q_{a,c}}u_{a,i},
+\]
+定义局部扩散矩阵
+\[
+\Sigma_{a,c}^{\mathrm{geom}}
+=
+\frac{1}{N_{a,c}}
+\sum_{x_{a,i}\in Q_{a,c}}
+\big(u_{a,i}-\mu_{a,c}^{\mathrm{geom}}\big)
+\big(u_{a,i}-\mu_{a,c}^{\mathrm{geom}}\big)^\top.
+\]
+
+同时，对每块统计曲率与法向分散度：
+\[
+\bar H_{a,c}
+=
+\frac{1}{N_{a,c}}
+\sum_{x_{a,i}\in Q_{a,c}}H(x_{a,i}),
+\qquad
+\bar K_{a,c}
+=
+\frac{1}{N_{a,c}}
+\sum_{x_{a,i}\in Q_{a,c}}K(x_{a,i}),
+\]
+\[
+\delta n_{a,c}
+=
+\frac{1}{N_{a,c}}
+\sum_{x_{a,i}\in Q_{a,c}}
+\big(1-n(x_{a,i})\cdot n_a\big).
+\]
+
+于是几何块写为
+\[
+ES_{a,\mathrm{geom}}^{\mathrm{local}}
+=
+\Big[
+\{r_{a,c}^{\mathrm{occ}}\}_{c=1}^{4},\
+\{r_{a,c}^{\mathrm{area}}\}_{c=1}^{4},\
+\{\mu_{a,c}^{\mathrm{geom}}\}_{c=1}^{4},\
+\{\Sigma_{a,c}^{\mathrm{geom}}\}_{c=1}^{4},\
+\{\bar H_{a,c}\}_{c=1}^{4},\
+\{\bar K_{a,c}\}_{c=1}^{4},\
+\{\delta n_{a,c}\}_{c=1}^{4}
+\Big].
+\]
+
+\subsection{标量块的组成}
+
+标量块回答的问题是：\emph{该 FCLC 内部各块的标量场分布是什么样的？}
+
+设点级标量特征为
+\[
+h_{a,i}^{s}.
+\]
+对每个块 \(Q_{a,c}\)，定义标量均值
+\[
+\mu_{a,c}^{s}
+=
+\frac{1}{N_{a,c}}
+\sum_{x_{a,i}\in Q_{a,c}}h_{a,i}^{s},
+\]
+以及标量离散度
+\[
+\sigma_{a,c}^{s}
+=
+\frac{1}{N_{a,c}}
+\sum_{x_{a,i}\in Q_{a,c}}
+\big(h_{a,i}^{s}-\mu_{a,c}^{s}\big)^2.
+\]
+
+为了显式刻画局部方向性，引入对置块差：
+\[
+\Delta_{a,(1,3)}^{s}=\mu_{a,1}^{s}-\mu_{a,3}^{s},
+\qquad
+\Delta_{a,(2,4)}^{s}=\mu_{a,2}^{s}-\mu_{a,4}^{s}.
+\]
+
+于是标量块为
+\[
+ES_{a,\mathrm{scalar}}^{\mathrm{local}}
+=
+\Big[
+\{\mu_{a,c}^{s}\}_{c=1}^{4},\
+\{\sigma_{a,c}^{s}\}_{c=1}^{4},\
+\Delta_{a,(1,3)}^{s},\
+\Delta_{a,(2,4)}^{s}
+\Big].
+\]
+
+\subsection{向量块的组成}
+
+向量块回答的问题是：\emph{该 FCLC 内切向量场在方向和强度上如何组织？}
+
+设点级向量特征为
+\[
+h_{a,i}^{v},
+\]
+并将其投影到当前 FCLC 的局部 frame 下，记为
+\[
+\mathrm{Proj}_a(h_{a,i}^{v}).
+\]
+
+对每个块 \(Q_{a,c}\)，定义块内向量均值
+\[
+\mu_{a,c}^{v}
+=
+\frac{1}{N_{a,c}}
+\sum_{x_{a,i}\in Q_{a,c}}
+\mathrm{Proj}_a(h_{a,i}^{v}),
+\]
+模长均值
+\[
+m_{a,c}^{v}
+=
+\frac{1}{N_{a,c}}
+\sum_{x_{a,i}\in Q_{a,c}}
+\left\|
+\mathrm{Proj}_a(h_{a,i}^{v})
+\right\|,
+\]
+向量离散度
+\[
+\delta_{a,c}^{v}
+=
+\frac{1}{N_{a,c}}
+\sum_{x_{a,i}\in Q_{a,c}}
+\left\|
+\mathrm{Proj}_a(h_{a,i}^{v})-\mu_{a,c}^{v}
+\right\|^2.
+\]
+
+引入对置块向量差和内积：
+\[
+\Delta_{a,(1,3)}^{v}=\mu_{a,1}^{v}-\mu_{a,3}^{v},
+\qquad
+\Delta_{a,(2,4)}^{v}=\mu_{a,2}^{v}-\mu_{a,4}^{v},
+\]
+\[
+\langle \mu_{a,1}^{v},\mu_{a,3}^{v}\rangle,
+\qquad
+\langle \mu_{a,2}^{v},\mu_{a,4}^{v}\rangle.
+\]
+
+于是向量块为
+\[
+ES_{a,\mathrm{vector}}^{\mathrm{local}}
+=
+\Big[
+\{\mu_{a,c}^{v}\}_{c=1}^{4},\
+\{m_{a,c}^{v}\}_{c=1}^{4},\
+\{\delta_{a,c}^{v}\}_{c=1}^{4},\
+\Delta_{a,(1,3)}^{v},\
+\Delta_{a,(2,4)}^{v},\
+\langle \mu_{a,1}^{v},\mu_{a,3}^{v}\rangle,\
+\langle \mu_{a,2}^{v},\mu_{a,4}^{v}\rangle
+\Big].
+\]
+
+\subsection{三块如何组成 \(ES_a^{\mathrm{local}}\)}
+
+最终，
+\[
+ES_a^{\mathrm{local}}
+=
+\Big[
+ES_{a,\mathrm{geom}}^{\mathrm{local}},\
+ES_{a,\mathrm{scalar}}^{\mathrm{local}},\
+ES_{a,\mathrm{vector}}^{\mathrm{local}}
+\Big].
+\]
+
+这里的设计有三条明确原则：
+
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{按对象类型组织：} 几何块管局部形，标量块管局部值，向量块管局部方向；
+    \item \textbf{块内统计 + 块间差异并重：} 不只看局部均值，还要保留块间结构；
+    \item \textbf{显式性：} \(ES\) 是从几何、标量场与向量场明确构造出来的，而不是网络隐式学出的黑箱变量。
+\end{enumerate}
+
+\subsection{与 X-3D 思想的对应关系}
+
+我们此前专门讨论过，这里的 \(ES\) 与 X-3D 中的显式结构思想具有对应关系，但不简单照搬。具体来说：
+
+\begin{itemize}[leftmargin=2em]
+    \item X-3D 在 3D 欧氏点云上做显式邻域结构建模；
+    \item 本文在 2D 流形 chart 上做显式局部结构建模；
+    \item X-3D 借助 PointHop 等分区表达局部结构；
+    \item 本文借助局部 frame 下的四块结构表达局部 chart 的方向性与局部几何--物理模式。
+\end{itemize}
+
+因此，本文的 \(ES_a^{\mathrm{local}}\) 可以看作对“显式局部结构 \(\to\) 动态局部核”这一思想在二维流形 chart 场景下的推广。
+
+%========================================================
+\section{从 \(ES\) 到局部调制特征 \(\tilde F\)，以及 \(\tilde F\) 如何控制局部传播}
+
+\subsection{为什么 \(ES\) 不能直接进入消息函数}
+
+尽管 \(ES_a^{\mathrm{local}}\) 已经是显式结构描述子，但它本身并不直接适合用作消息函数输入。原因有二：
+
+\begin{enumerate}[leftmargin=2em]
+    \item 它是由几何、标量、向量三类异质对象拼成的结构，需要类型化处理；
+    \item 它的作用不是替代局部传播，而是为局部传播生成“该 chart 的传播风格”。
+\end{enumerate}
+
+因此，我们先对 \(ES\) 做类型化编码，得到局部调制特征
+\[
+\tilde F_a^{\mathrm{local}}.
+\]
+
+\subsection{分块编码与融合}
+
+先分别对三类块进行编码：
+\[
+f_a^{g}=\mathrm{Enc}_{g}\big(ES_{a,\mathrm{geom}}^{\mathrm{local}}\big),
+\]
+\[
+f_a^{s}=\mathrm{Enc}_{s}\big(ES_{a,\mathrm{scalar}}^{\mathrm{local}}\big),
+\]
+\[
+f_a^{v}=\mathrm{Enc}_{v}\big(ES_{a,\mathrm{vector}}^{\mathrm{local}}\big).
+\]
+
+然后通过融合模块进行中途交互：
+\[
+\bar f_a
+=
+\mathrm{Fuse}
+\big(
+f_a^{g},f_a^{s},f_a^{v}
+\big).
+\]
+
+最后得到 FCLC 内局部调制特征：
+\[
+\tilde F_a^{\mathrm{local}}
+=
+\mathrm{Enc}_{\mathrm{local}}
+\big(
+ES_a^{\mathrm{local}}
+\big).
+\]
+
+在实现上，可写为
+\[
+\tilde F_a^{\mathrm{local}}
+=
+\big(
+\tilde F_a^{s,\mathrm{local}},
+\tilde F_a^{v,\mathrm{local}}
+\big).
+\]
+第一版中，我们优先使用标量主调制向量 \(\tilde F_a^{s,\mathrm{local}}\)，而把向量信息主要吸收到其不变量或弱等变分量中，以获得更稳的训练过程。
+
+\subsection{局部调制特征如何控制 FCLC 内部传播}
+
+在第 \(t\) 个 block、第 \(\ell\) 次局部传播中，设 FCLC \(P_a\) 内节点 \(i\) 的局部状态为
+\[
+\tilde h_{a,i}^{(t,\ell)}.
+\]
+其在当前 FCLC 内的邻居集合为 \(\mathcal N_a(i)\)。
+
+我们此前已经定下：FCLC 内传播不是普通共享 GNN，而是“由显式结构调制的局部传播”。因此，先由 \(\tilde F_a^{\mathrm{local}}\) 生成局部门控与局部注意力偏置：
+\[
+g_a^{\mathrm{local}}
+=
+\sigma\big(
+\Theta_g(\tilde F_a^{\mathrm{local}})
+\big),
+\qquad
+\beta_a^{\mathrm{local}}
+=
+\Theta_\beta(\tilde F_a^{\mathrm{local}}).
+\]
+
+然后对每条局部边 \((i,j)\)，定义相对局部几何量
+\[
+r_{a,ij},
+\]
+它可以包括：
+\begin{itemize}[leftmargin=2em]
+    \item 局部坐标差 \(u_{a,j}-u_{a,i}\)；
+    \item 局部块编号差；
+    \item 相对法向偏移或局部角度信息。
+\end{itemize}
+
+基于这些量，定义局部 attention：
+\[
+\alpha_{a,ij}^{(t,\ell)}
+=
+\mathrm{softmax}_{j\in\mathcal N_a(i)}
+\Big(
+\psi\big(
+\tilde h_{a,i}^{(t,\ell)},
+\tilde h_{a,j}^{(t,\ell)},
+r_{a,ij}
+\big)
++
+\beta_a^{\mathrm{local}}
+\Big).
+\]
+
+于是局部边消息为
+\[
+m_{a,i\leftarrow j}^{(t,\ell)}
+=
+\alpha_{a,ij}^{(t,\ell)}
+\;
+g_a^{\mathrm{local}}
+\odot
+\phi_{\mathrm{local}}
+\big(
+\tilde h_{a,j}^{(t,\ell)},
+r_{a,ij}
+\big).
+\]
+
+最终节点更新为
+\[
+\tilde h_{a,i}^{(t,\ell+1)}
+=
+\tilde h_{a,i}^{(t,\ell)}
++
+\Phi_{\mathrm{upd}}
+\Big(
+\tilde h_{a,i}^{(t,\ell)},
+\sum_{j\in\mathcal N_a(i)}m_{a,i\leftarrow j}^{(t,\ell)},
+p_a^{(t)}
+\Big).
+\]
+
+\subsection{这一设计的意义}
+
+这一局部传播机制明确体现了我们此前的结构主张：
+
+\begin{quote}
+\textbf{\(\tilde F_a^{\mathrm{local}}\) 不是一个被动拼接到节点特征上的辅助量，而是该 FCLC 局部几何--物理结构的显式摘要；它主动决定该 chart 内部的传播风格。}
+\end{quote}
+
+换句话说，本文在 FCLC 内部所做的不是“局部点云上的普通消息传递”，而是“显式结构决定的局部传播”。
+
+\bigskip
+\noindent
+
+%========================================================
+\section{FCLC 再编码：从局部状态到 chart 级表示}
+
+\subsection{为什么需要再编码而不是简单 pooling}
+
+在单个 FCLC 内完成三次局部传播后，我们已经得到该 FCLC 内每个节点的局部状态
+\[
+\tilde h_{a,i}^{(t,3)}.
+\]
+
+此时若直接对这些节点状态做 mean pooling 或 max pooling，虽然可以得到一个 chart 级向量，但会丢失两个重要结构：
+
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{块级结构：} 四个局部块之间的差异关系会被过度抹平；
+    \item \textbf{类型结构：} 标量型状态与向量型状态的不同作用会被混在一起。
+\end{enumerate}
+
+因此，我们此前明确决定：FCLC 内部的节点状态在完成局部传播后，不直接做普通池化，而是再次沿用“显式结构范式”进行再编码，从而得到 FCLC 级中间状态。
+
+\subsection{再编码输入的组织方式}
+
+在第 \(t\) 个 block 结束 FCLC 内局部传播后，对 FCLC \(P_a\) 中的局部状态集合
+\[
+\{\tilde h_{a,i}^{(t,3)}\}_{x_i\in P_a}
+\]
+重新按四个局部块
+\[
+Q_{a,1},Q_{a,2},Q_{a,3},Q_{a,4}
+\]
+组织起来。
+
+设节点局部状态仍区分为标量型和向量型部分：
+\[
+\tilde h_{a,i}^{(t,3)}
+=
+\big(
+\tilde h_{a,i}^{s,(t,3)},\
+\tilde h_{a,i}^{v,(t,3)}
+\big).
+\]
+
+则可分别在每个块内统计：
+\begin{itemize}[leftmargin=2em]
+    \item 标量块级均值、方差与差分；
+    \item 向量块级均值、模长、离散度与对置块关系；
+    \item 与前述 \(ES_a^{\mathrm{local}}\) 同构的局部再编码对象。
+\end{itemize}
+
+因此，再编码并不是和 \(ES_a^{\mathrm{local}}\) 完全无关的新模块，而是：
+\begin{quote}
+\textbf{对当前更新后的局部状态再次施加与初始显式结构编码相似的组织范式。}
+\end{quote}
+
+\subsection{FCLC 中间状态的定义}
+
+定义 FCLC 的中间状态为
+\[
+p_a^{(t,\mathrm{mid})}
+=
+\mathrm{Enc}_{\mathrm{chart}}
+\big(
+\{\tilde h_{a,i}^{(t,3)}\}_{x_i\in P_a}
+\big)
+=
+\big(
+p_a^{s,(t,\mathrm{mid})},\
+p_a^{v,(t,\mathrm{mid})}
+\big).
+\]
+
+这里：
+\begin{itemize}[leftmargin=2em]
+    \item \(p_a^{s,(t,\mathrm{mid})}\) 是 chart 级标量表示；
+    \item \(p_a^{v,(t,\mathrm{mid})}\) 是 chart 级向量表示。
+\end{itemize}
+
+必须再次强调：
+\[
+p_a^{(t,\mathrm{mid})}\neq \tilde h_{a,\mathrm{center}}^{(t,3)}.
+\]
+也就是说，FCLC 的整体表示不是中心节点的状态，而是整个 chart 内局部状态经结构化聚合后得到的 chart 级状态。
+
+\subsection{重叠节点在再编码中的处理}
+
+由于同一物理节点可能属于多个 FCLC，因此在不同 FCLC 再编码时，它可能以不同局部状态出现。这是双状态机制的自然结果。
+
+在第一版中，我们采取较直接的处理：FCLC 再编码使用当前 chart 内的局部状态
+\[
+\{\tilde h_{a,i}^{(t,3)}\}_{x_i\in P_a}
+\]
+直接聚合，而不额外再对重叠节点进行 \(\omega_{a,i}\) 加权。
+
+但我们此前也讨论过，这里存在一个可选增强方向：为了避免重叠节点在多个 chart 中被过度重复计入，可在再编码中引入隶属权重
+\[
+\omega_{a,i}
+\]
+做加权。例如可写为
+\[
+p_a^{(t,\mathrm{mid})}
+=
+\mathrm{Enc}_{\mathrm{chart}}
+\big(
+\{\omega_{a,i}\tilde h_{a,i}^{(t,3)}\}_{x_i\in P_a}
+\big).
+\]
+
+这一项在第一版中不作为硬要求，但明确保留为后续改进方向。
+
+%========================================================
+\section{层内聚合：层内全局显式结构、主传播与上下文修正}
+
+\subsection{为什么层内传播不能只看局部重叠}
+
+在单个 FCLC 完成局部建模后，我们需要在同一层的不同 FCLC 之间传递信息。此时有两种显然可用的信息：
+
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{全局几何关系：} 当前 chart 相对于该层参考 chart 的位置与姿态；
+    \item \textbf{局部重叠上下文：} 两个 chart 共享节点所反映的真实局部重叠关系。
+\end{enumerate}
+
+我们此前明确决定：层内传播的主通道不由重叠区来替代，而是采用
+
+\begin{quote}
+\textbf{层内全局显式调制特征主导的 chart 图传播 + overlap-context 对边消息的补充修正。}
+\end{quote}
+
+原因是：
+
+\begin{itemize}[leftmargin=2em]
+    \item 若只看重叠，上下文只能覆盖相邻或重叠 chart，难以表达整层中的半全局结构身份；
+    \item 若只看全局位置关系，又会丢失真正的共享局部上下文；
+    \item 因此二者应同时存在，但层内的主传播骨架仍应是 chart 图上的主 GNN。
+\end{itemize}
+
+\subsection{每层 reference FCLC 的选取}
+
+对每一层 \(M_k\)，选取一个参考 FCLC
+\[
+P_0^{(k)}.
+\]
+
+各层参考 FCLC 采用同一种规则选取，例如 geodesic medoid FCLC 或其近似版本。我们此前已经讨论过，这样做是为了避免采用全局球面参数化或全局平面参数化所带来的不稳定性，并保持层内显式结构与 FCLC 内显式结构在“有中心组织”的范式上统一。
+
+\subsection{层内全局显式结构描述子}
+
+对于同层任意 FCLC \(P_a^{(k)}\)，构造其相对于参考 FCLC \(P_0^{(k)}\) 的层内全局显式结构描述子
+\[
+ES_a^{\mathrm{intra\text{-}center}}
+=
+\big[
+ES_{a,\mathrm{geom}}^{\mathrm{center}},
+ES_{a,\mathrm{scalar}}^{\mathrm{center}},
+ES_{a,\mathrm{vector}}^{\mathrm{center}}
+\big].
+\]
+
+\subsubsection{几何块}
+
+几何块由当前 chart 相对于参考 chart 的几何关系构成：
+\[
+ES_{a,\mathrm{geom}}^{\mathrm{center}}
+=
+\big[
+d_{M_k}(c_a,c_0),\
+\pi_a-\pi_0,\
+\Delta x_{a0}^{\top},\
+1-n_a\cdot n_0,\
+\cos\theta_{a0},\
+\sin\theta_{a0},\
+\log\frac{A(P_a)+\varepsilon}{A(P_0)+\varepsilon}
+\big].
+\]
+
+其中：
+\begin{itemize}[leftmargin=2em]
+    \item \(d_{M_k}(c_a,c_0)\) 是 geodesic 距离；
+    \item \(\pi_a-\pi_0\) 是层内相对位置编码差；
+    \item \(\Delta x_{a0}^{\top}\) 是在参考 chart 局部 frame 下的切平面投影位移；
+    \item \(1-n_a\cdot n_0\) 描述法向差；
+    \item \((\cos\theta_{a0},\sin\theta_{a0})\) 描述相对 frame 旋转；
+    \item \(\log\frac{A(P_a)+\varepsilon}{A(P_0)+\varepsilon}\) 描述相对面积尺度。
+\end{itemize}
+
+\subsubsection{标量块}
+
+标量块直接由 FCLC 级标量状态给出：
+\[
+ES_{a,\mathrm{scalar}}^{\mathrm{center}}
+=
+\big[
+p_a^s,\
+p_0^s,\
+p_a^s-p_0^s
+\big].
+\]
+
+这与我们此前讨论一致：层内全局显式结构中的标量块不重新回到原始点级标量，而直接使用当前 chart 级标量表示。
+
+\subsubsection{向量块}
+
+向量块由 FCLC 级向量状态在参考 chart frame 下的表达构成：
+\[
+ES_{a,\mathrm{vector}}^{\mathrm{center}}
+=
+\big[
+\mathrm{Proj}_{0}(p_a^v),\
+\mathrm{Proj}_{0}(p_0^v),\
+\mathrm{Proj}_{0}(p_a^v-p_0^v),\
+\|p_a^v\|,\
+\|p_0^v\|,\
+\langle p_a^v,p_0^v\rangle
+\big].
+\]
+
+之所以这样定义，是因为我们此前已经明确：
+
+\begin{quote}
+\textbf{层内全局显式结构中的几何块、标量块、向量块，在组织范式上应与 FCLC 内部显式结构保持同一种思路，只是对象从“节点”提升为“chart”。}
+\end{quote}
+
+\subsection{层内全局显式调制特征}
+
+对层内全局显式结构描述子做类型化编码，得到层内调制特征：
+\[
+\tilde F_a^{\mathrm{intra\text{-}center}}
+=
+\mathrm{Enc}_{\mathrm{intra\text{-}center}}
+\big(
+ES_a^{\mathrm{intra\text{-}center}}
+\big).
+\]
+
+它的含义可以概括为：
+
+\begin{quote}
+\textbf{当前 FCLC 在其所在层中的“结构身份调制特征”。}
+\end{quote}
+
+也就是说，它不只是某个几何坐标，而是当前 chart 相对于该层参考 chart 的综合身份编码。
+
+\subsection{层内主消息核的生成}
+
+对同层边 \((a,b)\)，构造
+\[
+z_{ab}^{\mathrm{intra}}
+=
+\Big[
+\tilde F_a^{\mathrm{intra\text{-}center}},
+\tilde F_b^{\mathrm{intra\text{-}center}},
+\tilde F_a^{\mathrm{intra\text{-}center}}-\tilde F_b^{\mathrm{intra\text{-}center}},
+\tilde F_a^{\mathrm{intra\text{-}center}}\odot \tilde F_b^{\mathrm{intra\text{-}center}}
+\Big].
+\]
+
+通过小型 MLP 生成 attention bias 与 gate：
+\[
+\beta_{ab}^{\mathrm{intra}}
+=
+\mathrm{MLP}_{\beta}^{\mathrm{intra}}(z_{ab}^{\mathrm{intra}}),
+\]
+\[
+g_{ab}^{\mathrm{intra}}
+=
+\sigma\Big(
+\mathrm{MLP}_{g}^{\mathrm{intra}}(z_{ab}^{\mathrm{intra}})
+\Big).
+\]
+
+注意，这里第一版故意不生成全维 dense kernel，而是采用“轻量 MLP + bias/gate”的形式。其原因正如我们此前讨论的那样：
+
+\begin{enumerate}[leftmargin=2em]
+    \item 第一版的关键不在于把核生成器做得多复杂，而在于验证“显式结构调制 + 层级传播”这一主线；
+    \item bias 与 gate 已经足以让当前 chart 的层内结构身份影响边消息；
+    \item 更复杂的低秩核或 basis mixture 可放到后续改进版本。
+\end{enumerate}
+
+\subsection{层内主传播公式}
+
+设当前 block 中 FCLC 的中间状态为
+\[
+p_a^{(t,\mathrm{mid})},
+\qquad
+p_b^{(t,\mathrm{mid})}.
+\]
+
+定义层内基础 attention：
+\[
+\alpha_{ab}^{\mathrm{intra}}
+=
+\mathrm{softmax}_{b}
+\Big(
+\psi_{\mathrm{intra}}(
+p_a^{(t,\mathrm{mid})},
+p_b^{(t,\mathrm{mid})}
+)
++
+\beta_{ab}^{\mathrm{intra}}
+\Big).
+\]
+
+基础边消息为
+\[
+m_{a\leftarrow b}^{\mathrm{base}}
+=
+\alpha_{ab}^{\mathrm{intra}}
+\;
+g_{ab}^{\mathrm{intra}}
+\odot
+\phi_{\mathrm{intra}}
+\big(
+p_b^{(t,\mathrm{mid})}
+\big).
+\]
+
+这里 \(\phi_{\mathrm{intra}}\) 是发送端 chart 状态的特征变换函数。
+
+\subsection{overlap-context：对边消息的补充修正}
+
+对于同层中存在重叠的两个 chart，定义重叠点集
+\[
+O_{ab}=P_a\cap P_b.
+\]
+
+基于共享节点的当前状态，定义 overlap-context：
+\[
+C_{ab}
+=
+\mathrm{CtxEnc}
+\big(
+\{h_i:\ x_i\in O_{ab}\}
+\big).
+\]
+
+这里必须再次强调我们此前反复纠正过的一点：
+
+\begin{quote}
+\textbf{overlap-context 不是层内传播的替代主干，而只是对主边消息的补充修正。}
+\end{quote}
+
+因此，定义修正项
+\[
+\Delta m_{a\leftarrow b}^{\mathrm{ctx}}
+=
+\Psi_{\mathrm{ctx}}
+\big(
+m_{a\leftarrow b}^{\mathrm{base}},
+C_{ab},
+\mathrm{ov}(a,b)
+\big),
+\]
+其中 \(\mathrm{ov}(a,b)\) 表示 chart 重叠比例或重叠强度。
+
+最终层内边消息定义为
+\[
+m_{a\leftarrow b}^{\mathrm{intra}}
+=
+m_{a\leftarrow b}^{\mathrm{base}}
++
+\Delta m_{a\leftarrow b}^{\mathrm{ctx}}.
+\]
+
+\subsection{层内聚合与状态更新}
+
+对当前 FCLC \(P_a\)，聚合同层邻居消息：
+\[
+m_a^{\mathrm{intra}}
+=
+\sum_b m_{a\leftarrow b}^{\mathrm{intra}}.
+\]
+
+然后定义层内更新：
+\[
+\bar p_a^{(t)}
+=
+p_a^{(t,\mathrm{mid})}
++
+\Phi_{\mathrm{intra}}
+\big(
+p_a^{(t,\mathrm{mid})},
+m_a^{\mathrm{intra}}
+\big).
+\]
+
+这里 \(\bar p_a^{(t)}\) 表示经过层内传播后的 chart 状态，它将在后续层间传播中作为输入。
+
+%========================================================
+\section{层间聚合：法向投影、方向性对应与层间传播}
+
+\subsection{为什么层间传播不照搬层内结构}
+
+我们此前已经明确：层间关系的本质不是“几何重叠”，而是\textbf{壳层之间沿法向方向的对应与演化}。因此，层间传播不应照搬层内的 overlap 机制，而应以法向投影诱导的方向性对应关系为主干。
+
+这意味着：
+\begin{itemize}[leftmargin=2em]
+    \item 层间的主边是“谁对应谁”，而不是“谁和谁重叠”；
+    \item 层间的权重是有方向的；
+    \item 一对多、多对一的对应是允许的。
+\end{itemize}
+
+\subsection{点级法向对应}
+
+对相邻层 \(M_k\) 与 \(M_{k+1}\)，定义从第 \(k\) 层到第 \(k+1\) 层的点级法向对应
+\[
+\Pi_{k\to k+1}(x)\in M_{k+1}.
+\]
+
+它可通过沿法向方向的射线投影或数值跟踪得到。其意义是：从当前层上的一个点，找到下一层上与之最自然对应的点。
+
+\subsection{方向性对应权重}
+
+对接收端 FCLC \(P_a^{(k)}\) 与发送端 FCLC \(P_b^{(k+1)}\)，定义
+\[
+w_{a\leftarrow b}^{k\leftarrow k+1}
+=
+\frac{
+\left|
+\{x\in\mathcal D_a^{k\to k+1}:\ \Pi_{k\to k+1}(x)\in P_b^{(k+1)}\}
+\right|
+}{
+|\mathcal D_a^{k\to k+1}|
+},
+\]
+其中
+\[
+\mathcal D_a^{k\to k+1}
+=
+\{x\in P_a^{(k)}:\ \Pi_{k\to k+1}(x)\ \text{定义良好}\}.
+\]
+
+我们此前专门讨论过：之所以这样定义，是因为层间传播本身就是方向性的，所以一般有
+\[
+w_{a\leftarrow b}^{k\leftarrow k+1}
+\neq
+w_{b\leftarrow a}^{k+1\leftarrow k}.
+\]
+
+这不是缺陷，而是设计目标。第一版中，我们采用以\textbf{接收端归一化}为主的定义，因为它最自然地反映了：
+
+\begin{quote}
+对于接收端 chart 来说，发送端 chart 覆盖了它多少“可对应区域”。
+\end{quote}
+
+必要时可进一步归一化为
+\[
+\tilde w_{a\leftarrow b}
+=
+\frac{
+w_{a\leftarrow b}
+}{
+\sum_{b'}w_{a\leftarrow b'}+\varepsilon
+}.
+\]
+
+\subsection{层间边特征}
+
+在方向性权重之外，我们还保留层间边特征
+\[
+e_{a\leftarrow b}^{\mathrm{inter}}
+=
+\big[
+\bar d_{a\leftarrow b},\
+\overline{(1-n\cdot n')}_{a\leftarrow b},\
+\|\hat c_a-c_b\|
+\big].
+\]
+
+它们分别表示：
+\begin{itemize}[leftmargin=2em]
+    \item 平均厚度；
+    \item 平均法向变化；
+    \item 中心投影误差。
+\end{itemize}
+
+这意味着，方向性权重 \(\tilde w_{a\leftarrow b}\) 决定“传多少”，而边特征 \(e_{a\leftarrow b}^{\mathrm{inter}}\) 则进一步决定“这条对应边属于什么类型”。
+
+\subsection{层间主传播公式}
+
+对方向性边 \(a\leftarrow b\)，构造
+\[
+z_{a\leftarrow b}^{\mathrm{inter}}
+=
+\Big[
+\bar p_a^{(t)},\
+\bar p_b^{(t)},\
+e_{a\leftarrow b}^{\mathrm{inter}},\
+\bar p_a^{(t)}-\bar p_b^{(t)},\
+\bar p_a^{(t)}\odot\bar p_b^{(t)}
+\Big].
+\]
+
+通过 MLP 生成层间 bias 与 gate：
+\[
+\beta_{a\leftarrow b}^{\mathrm{inter}}
+=
+\mathrm{MLP}_{\beta}^{\mathrm{inter}}
+\big(
+z_{a\leftarrow b}^{\mathrm{inter}}
+\big),
+\]
+\[
+g_{a\leftarrow b}^{\mathrm{inter}}
+=
+\sigma\Big(
+\mathrm{MLP}_{g}^{\mathrm{inter}}
+\big(
+z_{a\leftarrow b}^{\mathrm{inter}}
+\big)
+\Big).
+\]
+
+然后定义层间 attention：
+\[
+\alpha_{a\leftarrow b}^{\mathrm{inter}}
+=
+\mathrm{softmax}_{b}
+\Big(
+\psi_{\mathrm{inter}}
+\big(
+\bar p_a^{(t)},
+\bar p_b^{(t)},
+e_{a\leftarrow b}^{\mathrm{inter}}
+\big)
++
+\log(\tilde w_{a\leftarrow b}+\varepsilon)
++
+\beta_{a\leftarrow b}^{\mathrm{inter}}
+\Big).
+\]
+
+最终层间边消息为
+\[
+m_{a\leftarrow b}^{\mathrm{inter}}
+=
+\alpha_{a\leftarrow b}^{\mathrm{inter}}
+\;
+g_{a\leftarrow b}^{\mathrm{inter}}
+\odot
+\phi_{\mathrm{inter}}
+\big(
+\bar p_b^{(t)}
+\big).
+\]
+
+\subsection{层间聚合与状态更新}
+
+对接收端 FCLC \(P_a\)，聚合层间消息
+\[
+m_a^{\mathrm{inter}}
+=
+\sum_b m_{a\leftarrow b}^{\mathrm{inter}}.
+\]
+
+然后定义层间更新：
+\[
+p_a^{(t+1)}
+=
+\bar p_a^{(t)}
++
+\Phi_{\mathrm{inter}}
+\big(
+\bar p_a^{(t)},
+m_a^{\mathrm{inter}}
+\big).
+\]
+
+这一步完成后，当前 block 的 chart 级传播部分结束。
+
+\subsection{为何第一版不在层间再加入上下文修正}
+
+我们此前已经讨论并达成一致：第一版层间传播不再额外并联一个类似层内 overlap-context 的通道。原因是：
+
+\begin{enumerate}[leftmargin=2em]
+    \item 法向投影诱导的对应关系已经是很强的几何主干；
+    \item 方向性对应权重与层间边特征已经提供了足够丰富的边信息；
+    \item 若再并联额外上下文通道，会使第一版系统过重，不利于验证核心主线。
+\end{enumerate}
+
+后续版本可以探索多候选上下文修正或层间共享区域上下文，但第一版暂不纳入。
+
+%========================================================
+\section{block 递归、双层状态反馈与整体前向流程}
+
+\subsection{一个 block 的完整状态转移}
+
+综合前述内容，一个 block 的状态转移可理解为：
+\[
+(h^{(t)},p^{(t)})
+\;\Longrightarrow\;
+(h^{(t+1)},p^{(t+1)}).
+\]
+
+更细致地，局部部分可展开为
+\[
+\mathcal T_{\mathrm{local}}^{\,3}
+=
+\mathcal T_{\mathrm{merge}}
+\circ
+\mathcal T_{\mathrm{chart\_encode}}
+\circ
+\big(
+\mathcal T_{\mathrm{local\_msg}}
+\big)^3
+\circ
+\mathcal T_{\mathrm{init}},
+\]
+其中：
+\begin{itemize}[leftmargin=2em]
+    \item \(\mathcal T_{\mathrm{init}}\)：由全局节点主状态初始化各 chart 内局部状态；
+    \item \(\mathcal T_{\mathrm{local\_msg}}\)：一次 FCLC 内局部传播；
+    \item \(\mathcal T_{\mathrm{chart\_encode}}\)：局部状态 \(\to\) chart 中间状态；
+    \item \(\mathcal T_{\mathrm{merge}}\)：多个局部状态回写到全局节点主状态。
+\end{itemize}
+
+因此，更精确的 block 可写为
+\[
+\mathcal B
+=
+\mathcal T_{\mathrm{inter}}
+\circ
+\mathcal T_{\mathrm{intra}}
+\circ
+\mathcal T_{\mathrm{chart\_encode}}
+\circ
+\big(\mathcal T_{\mathrm{local\_msg}}\big)^3
+\circ
+\mathcal T_{\mathrm{init}}.
+\]
+
+\subsection{双层状态反馈的意义}
+
+我们此前多次强调：节点状态与 chart 状态都不应在 block 间重置，而应在上一轮基础上残差更新。其直观过程是：
+
+\begin{enumerate}[leftmargin=2em]
+    \item 节点先在各自 chart 内形成局部状态；
+    \item 局部状态聚合为 chart 状态；
+    \item chart 状态在层内和层间与其他 chart 交流；
+    \item 交流后的 chart 状态再回灌给其内部节点；
+    \item 下一轮节点传播继续从更新后的状态出发。
+\end{enumerate}
+
+这正是我们此前提到的“局部--中尺度--跨层--再反馈局部”的闭环。
+
+\subsection{整体递归表达}
+
+因此，完整网络的递归形式为
+\[
+(h^{(t+1)},p^{(t+1)})
+=
+\mathcal B(h^{(t)},p^{(t)}),
+\qquad
+t=0,1,\dots,L-1.
+\]
+
+经过 \(L\) 个 block 后，得到最终状态
+\[
+(h^{(L)},p^{(L)}).
+\]
+
+%========================================================
+\section{全局读出与输出头}
+
+\subsection{为什么要先压缩为标量主表示}
+
+经过 \(L\) 个 block 后，每个 FCLC 都具有最终双类型状态
+\[
+p_a^{(L)}
+=
+\big(
+p_a^{s,(L)},\
+p_a^{v,(L)}
+\big).
+\]
+
+但输出头是为了预测诸如总能量等全局标量物理量，因此在全局读出前，我们需要先将每个 chart 的双类型状态转化为适合全局回归的标量主表示。
+
+定义向量不变量摘要
+\[
+\mathrm{Inv}\big(p_a^{v,(L)}\big),
+\]
+例如包括模长、内积等不变量。然后定义
+\[
+\hat p_a
+=
+\Psi_{\mathrm{inv}}
+\big(
+p_a^{s,(L)},
+\mathrm{Inv}(p_a^{v,(L)})
+\big).
+\]
+
+这一步的作用是：保留 chart 级结构信息，同时使其更适合预测旋转不变的全局物理量。
+
+\subsection{全局 pooling}
+
+在全局层面，我们同时采用 attention pooling 和 mean pooling。
+
+首先定义 attention 权重
+\[
+\alpha_a^{\mathrm{pool}}
+=
+\mathrm{softmax}_{a}
+\Big(
+\mathrm{MLP}_{\mathrm{pool}}(\hat p_a)
+\Big).
+\]
+
+然后得到 attention pooling 结果
+\[
+z_{\mathrm{att}}
+=
+\sum_a \alpha_a^{\mathrm{pool}}\hat p_a,
+\]
+以及 mean pooling 结果
+\[
+z_{\mathrm{mean}}
+=
+\frac1N\sum_a \hat p_a.
+\]
+
+最终全局表示定义为
+\[
+z=
+\big[
+z_{\mathrm{att}},\
+z_{\mathrm{mean}}
+\big].
+\]
+
+我们此前之所以选择 attention + mean，而不是只用其中一个，是因为：
+\begin{itemize}[leftmargin=2em]
+    \item attention pooling 允许模型显式判断哪些 chart 更重要；
+    \item mean pooling 提供更稳的全局统计基线；
+    \item 二者拼接通常比单独使用更稳。
+\end{itemize}
+
+\subsection{输出头}
+
+定义共享头
+\[
+h_{\mathrm{glob}}
+=
+\mathrm{MLP}_{\mathrm{shared}}(z).
+\]
+
+若是单任务回归，则
+\[
+\hat y=\mathrm{Head}(h_{\mathrm{glob}}).
+\]
+
+若是多任务回归，则
+\[
+\hat y_j=\mathrm{Head}_j(h_{\mathrm{glob}}).
+\]
+
+我们此前还讨论过一种后续可解释扩展：令模型额外预测每个 chart 对总能量的贡献
+\[
+\hat E=\sum_a \hat e_a,
+\]
+即“层次贡献头”。这有助于分析哪些 chart 或哪些流形层对总能量更重要，但在第一版中先不作为主输出方案。
+
+%========================================================
+\section{损失函数与物理一致性正则}
+
+\subsection{主回归损失}
+
+对最终输出，主损失采用 Huber 回归损失。
+
+单任务时：
+\[
+\mathcal L_{\mathrm{main}}
+=
+\mathrm{HuberLoss}(\hat y,y).
+\]
+
+多任务时：
+\[
+\mathcal L_{\mathrm{main}}
+=
+\sum_j
+\lambda_j\,
+\mathrm{HuberLoss}(\hat y_j,y_j).
+\]
+
+我们此前已经明确，之所以第一版优先用 Huber 而不是纯 MSE 或纯 MAE，是因为：
+\begin{itemize}[leftmargin=2em]
+    \item 它比 MSE 对极端误差更稳；
+    \item 它比 MAE 更平滑，更容易优化；
+    \item 适合第一版需要优先保证稳定训练的场景。
+\end{itemize}
+
+\subsection{层间一致性正则}
+
+可选地加入层间一致性正则：
+\[
+\mathcal L_{\mathrm{inter\text{-}cons}}
+=
+\sum_{a,b}
+\tilde w_{a\leftarrow b}\,
+\|\hat p_a-\hat p_b\|^2.
+\]
+
+该项的目的不是强行把强对应 chart 的表示变得完全一样，而是鼓励在方向性对应很强时，表示保持适度一致。
+
+\subsection{电子密度响应稳定正则}
+
+我们此前专门澄清过，不应把“总能量对电子密度的导数应是常数”作为硬约束，因为这在严格理论上只在特定框架下才成立。
+
+更稳妥的做法，是引入\textbf{局部响应低波动正则}。对某局部区域对应的离散密度自由度集合 \(\mathcal I_a\)，定义
+\[
+\mathcal L_{\mathrm{eff}}
+=
+\sum_a
+\mathrm{Var}
+\Big(
+\Big\{
+\frac{\partial \hat E}{\partial \rho_i}
+\Big\}_{i\in\mathcal I_a}
+\Big).
+\]
+
+其含义是：
+\begin{quote}
+\textbf{模型预测的能量对电子密度的局部响应不应无规则剧烈震荡，而应保持相对平滑与低波动。}
+\end{quote}
+
+这并不声称模型严格满足某个变分方程，而只是引入一种弱物理一致性，从而帮助训练稳定。
+
+\subsection{总损失}
+
+最终总损失为
+\[
+\mathcal L
+=
+\mathcal L_{\mathrm{main}}
++
+\lambda_{\mathrm{inter}}
+\mathcal L_{\mathrm{inter\text{-}cons}}
++
+\lambda_{\mathrm{eff}}
+\mathcal L_{\mathrm{eff}}.
+\]
+
+第一版中，通常可先令
+\[
+\lambda_{\mathrm{inter}}
+\]
+和
+\[
+\lambda_{\mathrm{eff}}
+\]
+取较小值，先保证主回归任务稳定收敛，再逐步增加辅助正则的作用。
+
+%========================================================
+\section{实验计划与系统消融设计}
+
+\subsection{主任务设置}
+
+第一阶段的主任务为：
+\begin{itemize}[leftmargin=2em]
+    \item 基于电子密度预测分子总能量；
+    \item 若标签可得，扩展到多任务能量分量预测；
+    \item 分析各流形层、各 chart 和各层级传播在最终预测中的贡献。
+\end{itemize}
+
+\subsection{对比对象}
+
+计划与以下几类方法比较：
+\begin{itemize}[leftmargin=2em]
+    \item 原子图 GNN / 等变 GNN；
+    \item 直接基于三维体素的电子密度网络；
+    \item 基于点云/表面的显式结构方法；
+    \item 本方法的多个消融版本。
+\end{itemize}
+
+\subsection{消融实验清单}
+
+根据我们此前对话中已经明确讨论过的设计点，至少应包括以下消融：
+
+\paragraph{1. 多层流形与阈值策略相关}
+\begin{itemize}[leftmargin=2em]
+    \item 单层等值面 vs 多层等值面；
+    \item 单一均匀阈值策略 vs 混合阈值策略；
+    \item 不同层数 \(K\) 的影响。
+\end{itemize}
+
+\paragraph{2. FCLC atlas 构造相关}
+\begin{itemize}[leftmargin=2em]
+    \item FCLC vs 固定半径 patch；
+    \item 有无前沿边缘点打分 \(S_{\mathrm{frontier}}\)；
+    \item 有无二点打分 \(S_2\)；
+    \item 不同区域相容打分权重 \((\lambda_g,\lambda_s,\lambda_r)\)；
+    \item chart 重叠比例过少、适中、过多的比较。
+\end{itemize}
+
+\paragraph{3. 节点输入与局部状态相关}
+\begin{itemize}[leftmargin=2em]
+    \item 只用标量通道；
+    \item 标量 + 一个向量场；
+    \item 标量 + 两个向量场；
+    \item 是否加入 \(\partial_n^2\rho\)；
+    \item 全局唯一节点状态 vs 完全复制节点状态 vs 双状态机制。
+\end{itemize}
+
+\paragraph{4. FCLC 内显式结构相关}
+\begin{itemize}[leftmargin=2em]
+    \item 有无局部显式结构描述子 \(ES_a^{\mathrm{local}}\)；
+    \item 只用几何块 vs 几何+标量 vs 几何+标量+向量；
+    \item 有无由 \(\tilde F_a^{\mathrm{local}}\) 调制的局部 gate / bias。
+\end{itemize}
+
+\paragraph{5. 层内传播相关}
+\begin{itemize}[leftmargin=2em]
+    \item 有无层内全局显式调制特征；
+    \item 有无 overlap-context 修正；
+    \item 参考 FCLC anchor 方案 vs 无参考中心方案。
+\end{itemize}
+
+\paragraph{6. 层间传播相关}
+\begin{itemize}[leftmargin=2em]
+    \item 有无法向投影诱导的方向性对应；
+    \item 方向性权重是否接收端归一化；
+    \item 层间边特征有无厚度/法向变化/投影误差分量。
+\end{itemize}
+
+\paragraph{7. block 结构相关}
+\begin{itemize}[leftmargin=2em]
+    \item block 数 \(L\) 的影响；
+    \item 每个 block 中 local 次数 \(2,3,4\) 的比较；
+    \item 是否采用固定 \(3+1+1\) 节奏。
+\end{itemize}
+
+\paragraph{8. 损失函数相关}
+\begin{itemize}[leftmargin=2em]
+    \item 有无 \(\mathcal L_{\mathrm{inter\text{-}cons}}\)；
+    \item 有无 \(\mathcal L_{\mathrm{eff}}\)；
+    \item Huber vs MSE vs MAE。
+\end{itemize}
+
+%========================================================
+\section{风险、难点与应对}
+
+\subsection{预处理代价较高}
+多层等值面提取、FCLC atlas 生长以及层间对应计算会带来较大预处理开销。对此可采用：
+\begin{itemize}[leftmargin=2em]
+    \item 预处理缓存；
+    \item 候选边缘点裁剪；
+    \item 分层并行与分块处理。
+\end{itemize}
+
+\subsection{等值面质量依赖电子密度离散精度}
+若电子密度网格较粗，则法向、曲率与局部导数量可能不稳定。对此可采用：
+\begin{itemize}[leftmargin=2em]
+    \item 预平滑；
+    \item 鲁棒几何量估计；
+    \item 在块级统计中使用平均化抑制噪声。
+\end{itemize}
+
+\subsection{层间法向对应在复杂区域可能不稳定}
+对于局部复杂几何区，法向对应可能出现非唯一或投影失败。对此：
+\begin{itemize}[leftmargin=2em]
+    \item 仅对定义良好的点构造 \(\mathcal D_a^{k\to k+1}\)；
+    \item 使用方向性权重归一化抑制少量异常对应；
+    \item 保留投影误差作为层间边特征的一部分。
+\end{itemize}
+
+\subsection{响应稳定正则开销较高}
+\(\mathcal L_{\mathrm{eff}}\) 需要对输入密度自由度求导，训练开销较大。对此可在第一版中采取：
+\begin{itemize}[leftmargin=2em]
+    \item 对每个 chart 只采样少量局部自由度计算；
+    \item 隔若干步再启用该正则；
+    \item 或先在无该正则时预训练，再加入其微调。
+\end{itemize}
+
+%========================================================
+\section{研究计划与两阶段扩展路径}
+
+\subsection{第一阶段：判别建模}
+第一阶段完成如下模块：
+\begin{enumerate}[leftmargin=2em]
+    \item 多层等值流形提取；
+    \item FCLC atlas 生长；
+    \item FCLC 内显式结构建模与局部传播；
+    \item 层内显式调制与 overlap-context 修正；
+    \item 层间法向对应与方向性 attention 聚合；
+    \item 输出头与损失函数；
+    \item 系统消融与可解释性分析。
+\end{enumerate}
+
+\subsection{第二阶段：随机流形生成}
+第二阶段的目标不是从零生成任意几何对象，而是从简单流形状态出发，逐步扩散到第一阶段定义出的目标表示空间。也就是说：
+
+\begin{itemize}[leftmargin=2em]
+    \item 第一阶段学到的是一个多层流形 + chart atlas 的目标空间；
+    \item 第二阶段需要学习如何从简单流形演化到该目标空间中的对象；
+    \item 因而第一阶段的结构化表示是第二阶段生成任务的必要前提。
+\end{itemize}
+
+%========================================================
+\section{小结}
+
+截至本节，我们已经完成了以下关键设计的系统整理：
+
+\begin{enumerate}[leftmargin=2em]
+    \item 明确了电子密度到多层等值流形，再到 FCLC atlas 的整体表示链；
+    \item 明确了主网络输入对象、节点定义、节点特征保守方案与扩展方向；
+    \item 给出了 FCLC atlas 的完整生长逻辑：初始点、初始 FCLC、前沿、边缘点、二点函数、候选集、区域相容打分与质量函数；
+    \item 明确了双状态节点机制；
+    \item 详细给出了 FCLC 内部显式结构描述子 \(ES\) 的三块组成；
+    \item 说明了 \(ES\to \tilde F\) 的类型化编码逻辑；
+    \item 给出了 \(\tilde F\) 如何调控 FCLC 内局部传播的明确公式；
+    \item 进一步给出了层内、层间、全局读出、损失函数与实验设计的完整框架。
+\end{enumerate}
+
+接下来若继续扩展，可进一步把伪代码、工程接口与更正式的附录算法说明继续细化。
+
+%========================================================
+\appendix
+
+\section{附录A：算法伪代码版}
+
+\subsection{A.1 多层等值流形与 FCLC atlas 构造算法}
+
+\begin{algorithm}[H]
+\caption{Multi-level Isodensity Manifolds and FCLC Atlas Construction}
+\begin{algorithmic}[1]
+\Require 电子密度场 \(\rho\)，阈值集合 \(\{c_k\}_{k=1}^{K}\)
+\Ensure 多层流形 \(\{M_k\}\)，各层 FCLC atlas \(\{\mathcal A_k\}\)
+
+\For{$k=1,\dots,K$}
+    \State 提取等值流形面
+    \[
+    M_k=\{x:\rho(x)=c_k\}
+    \]
+    \State 将 \(M_k\) 分解为连通分量
+    \[
+    M_k=\bigsqcup_{\ell=1}^{L_k}M_{k,\ell}
+    \]
+    \For{每个连通分量 \(M_{k,\ell}\)}
+        \State 选取主种子点 \(c_1\)（例如 geodesic medoid）
+        \State 由区域相容打分 \(S_R\) 生成初始 FCLC
+        \[
+        P_1=\mathrm{Chart}(c_1;S_R)
+        \]
+        \State 令当前 atlas 为 \(\mathcal A_{k,\ell}=\{P_1\}\)
+        \State 令当前覆盖区域 \(\Omega_1=P_1\)
+
+        \While{存在未覆盖区域}
+            \State 计算当前前沿边缘点集 \(\mathcal F_t\)
+            \For{每个边缘点 \(b\in\mathcal F_t\)}
+                \State 计算前沿打分 \(S_{\mathrm{frontier}}(b)\)
+            \EndFor
+            \State 选择若干高分边缘点作为扩展起点
+
+            \For{每个已选边缘点 \(b\)}
+                \State 用二点函数 \(S_2\) 得到参考邻域
+                \[
+                N_2(b)=\{q:S_2(b,q)\le \tau_2\}
+                \]
+                \State 构造外向候选发起点集
+                \[
+                E_b=N_2(b)\setminus\Omega_t
+                \]
+                \For{每个 \(e\in E_b\)}
+                    \State 由 \(S_R\) 生成候选 FCLC
+                    \[
+                    P(e)=\mathrm{Chart}(e;S_R)
+                    \]
+                    \State 计算候选质量分数 \(Q(e)\)
+                \EndFor
+                \State 选取该边缘点对应的最佳候选 \(e_b^\star\)
+            \EndFor
+
+            \State 在所有候选中选取全局最优的新 FCLC 加入 atlas
+            \State 更新覆盖区域 \(\Omega_{t+1}\)
+        \EndWhile
+    \EndFor
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{A.2 节点双状态与局部传播算法}
+
+\begin{algorithm}[H]
+\caption{Node Dual-state Update inside FCLCs}
+\begin{algorithmic}[1]
+\Require 全局节点状态 \(\{h_i^{(t)}\}\)，当前 chart 状态 \(\{p_a^{(t)}\}\)
+\Ensure 更新后的节点状态与 chart 中间状态
+
+\For{每个节点 \(x_i\)}
+    \For{每个包含该节点的 FCLC \(P_a\), \(a\in \mathcal A(i)\)}
+        \State 初始化局部状态
+        \[
+        \tilde h_{a,i}^{(t,0)}
+        =
+        \Psi_{\mathrm{init}}
+        \big(
+        h_i^{(t)},
+        e_{a,i}^{\mathrm{loc}},
+        p_a^{(t)}
+        \big)
+        \]
+    \EndFor
+\EndFor
+
+\For{每个 FCLC \(P_a\)}
+    \State 构造局部显式结构描述子 \(ES_a^{\mathrm{local}}\)
+    \State 编码得到局部调制特征 \(\tilde F_a^{\mathrm{local}}\)
+    \For{\(\ell=0,1,2\)}
+        \For{每个节点 \(x_i\in P_a\)}
+            \State 聚合局部邻居消息
+            \[
+            \tilde h_{a,i}^{(t,\ell+1)}
+            =
+            \tilde h_{a,i}^{(t,\ell)}
+            +
+            \Phi_{\mathrm{local}}(\cdots)
+            \]
+        \EndFor
+    \EndFor
+    \State 再编码得到 chart 中间状态
+    \[
+    p_a^{(t,\mathrm{mid})}
+    =
+    \mathrm{Enc}_{\mathrm{chart}}
+    \big(
+    \{\tilde h_{a,i}^{(t,3)}\}_{x_i\in P_a}
+    \big)
+    \]
+\EndFor
+
+\For{每个物理节点 \(x_i\)}
+    \State 计算其在各 FCLC 中的隶属权重 \(\omega_{a,i}\)
+    \State 聚合局部状态
+    \[
+    h_i^{(t,\mathrm{agg})}
+    =
+    \sum_{a\in\mathcal A(i)}
+    \omega_{a,i}\tilde h_{a,i}^{(t,3)}
+    \]
+    \State 更新全局节点主状态
+    \[
+    h_i^{(t+1,0)}
+    =
+    h_i^{(t)}
+    +
+    \Psi_{\mathrm{merge}}
+    \big(
+    h_i^{(t)},
+    h_i^{(t,\mathrm{agg})}
+    \big)
+    \]
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{A.3 层内传播算法}
+
+\begin{algorithm}[H]
+\caption{Intra-layer Chart Propagation}
+\begin{algorithmic}[1]
+\Require 当前 chart 中间状态 \(\{p_a^{(t,\mathrm{mid})}\}\)
+\Ensure 层内更新后的 chart 状态 \(\{\bar p_a^{(t)}\}\)
+
+\For{每一层 \(M_k\)}
+    \State 选取参考 FCLC \(P_0^{(k)}\)
+    \For{该层每个 FCLC \(P_a^{(k)}\)}
+        \State 构造层内全局显式结构
+        \[
+        ES_a^{\mathrm{intra\text{-}center}}
+        \]
+        \State 编码得到层内调制特征
+        \[
+        \tilde F_a^{\mathrm{intra\text{-}center}}
+        \]
+    \EndFor
+
+    \For{每条同层边 \((a,b)\)}
+        \State 生成基础边消息
+        \[
+        m_{a\leftarrow b}^{\mathrm{base}}
+        \]
+        \If{\(P_a\cap P_b\neq\emptyset\)}
+            \State 计算 overlap-context
+            \[
+            C_{ab}=\mathrm{CtxEnc}(\{h_i:i\in O_{ab}\})
+            \]
+            \State 计算修正消息
+            \[
+            \Delta m_{a\leftarrow b}^{\mathrm{ctx}}
+            \]
+            \State 最终边消息
+            \[
+            m_{a\leftarrow b}^{\mathrm{intra}}
+            =
+            m_{a\leftarrow b}^{\mathrm{base}}
+            +
+            \Delta m_{a\leftarrow b}^{\mathrm{ctx}}
+            \]
+        \Else
+            \State 令
+            \[
+            m_{a\leftarrow b}^{\mathrm{intra}}
+            =
+            m_{a\leftarrow b}^{\mathrm{base}}
+            \]
+        \EndIf
+    \EndFor
+
+    \For{每个 FCLC \(P_a^{(k)}\)}
+        \State 聚合层内消息
+        \[
+        m_a^{\mathrm{intra}}=\sum_b m_{a\leftarrow b}^{\mathrm{intra}}
+        \]
+        \State 更新状态
+        \[
+        \bar p_a^{(t)}
+        =
+        p_a^{(t,\mathrm{mid})}
+        +
+        \Phi_{\mathrm{intra}}
+        (
+        p_a^{(t,\mathrm{mid})},
+        m_a^{\mathrm{intra}}
+        )
+        \]
+    \EndFor
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{A.4 层间传播算法}
+
+\begin{algorithm}[H]
+\caption{Inter-layer Directional Propagation}
+\begin{algorithmic}[1]
+\Require 层内更新后的 chart 状态 \(\{\bar p_a^{(t)}\}\)，方向性权重 \(\{\tilde w_{a\leftarrow b}\}\)
+\Ensure 新的 chart 状态 \(\{p_a^{(t+1)}\}\)
+
+\For{每对相邻层 \(M_k,M_{k+1}\)}
+    \For{每条方向性边 \(a\leftarrow b\)}
+        \State 构造层间边输入
+        \[
+        z_{a\leftarrow b}^{\mathrm{inter}}
+        \]
+        \State 生成层间 gate 和 bias
+        \[
+        g_{a\leftarrow b}^{\mathrm{inter}},\quad
+        \beta_{a\leftarrow b}^{\mathrm{inter}}
+        \]
+        \State 计算方向性 attention
+        \[
+        \alpha_{a\leftarrow b}^{\mathrm{inter}}
+        \]
+        \State 计算边消息
+        \[
+        m_{a\leftarrow b}^{\mathrm{inter}}
+        \]
+    \EndFor
+
+    \For{每个接收端 chart \(P_a\)}
+        \State 聚合层间消息
+        \[
+        m_a^{\mathrm{inter}}
+        =
+        \sum_b m_{a\leftarrow b}^{\mathrm{inter}}
+        \]
+        \State 更新状态
+        \[
+        p_a^{(t+1)}
+        =
+        \bar p_a^{(t)}
+        +
+        \Phi_{\mathrm{inter}}
+        \big(
+        \bar p_a^{(t)},
+        m_a^{\mathrm{inter}}
+        \big)
+        \]
+    \EndFor
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+%========================================================
+\section{附录B：工程实现备注}
+
+\subsection{B.1 关于第一版的保守实现}
+
+第一版建议遵循以下原则：
+
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{输入端保守：}
+    只使用
+    \[
+    \|\nabla\rho\|,\ \Delta\rho,\ H,\ K,\ \partial_n^2\rho
+    \]
+    与两个切向量场
+    \[
+    \nabla_M\|\nabla\rho\|,\ \nabla_M H.
+    \]
+
+    \item \textbf{局部传播保守：}
+    局部调制先用 gate + attention bias，不直接生成完整 dense kernel。
+
+    \item \textbf{层内传播保守：}
+    使用每层一个 reference FCLC，不在第一版中为每一对 chart 构造 pairwise 显式边结构。
+
+    \item \textbf{层间传播保守：}
+    采用法向投影 + 方向性权重 + 普通 attention，不额外并联复杂上下文修正。
+
+    \item \textbf{正则保守：}
+    \(\mathcal L_{\mathrm{eff}}\) 先弱启用，不作为强硬物理约束。
+\end{enumerate}
+
+\subsection{B.2 关于可缓存内容}
+
+以下对象建议在预处理后缓存，以降低训练成本：
+
+\begin{itemize}[leftmargin=2em]
+    \item 多层等值流形面 \(\{M_k\}\)
+    \item 各层离散节点与法向、曲率
+    \item FCLC atlas \(\{P_a^{(k)}\}\)
+    \item chart 局部 frame 与四块划分
+    \item 层间方向性对应关系 \(\{\tilde w_{a\leftarrow b}\}\)
+\end{itemize}
+
+\subsection{B.3 关于局部邻域 \(\mathcal N_a(i)\)}
+
+FCLC 内的局部邻域 \(\mathcal N_a(i)\) 第一版建议采用：
+
+\begin{itemize}[leftmargin=2em]
+    \item 基于 mesh 邻接；
+    \item 或 chart 内 geodesic 半径邻域；
+    \item 或固定近邻数的局部 geodesic KNN。
+\end{itemize}
+
+若局部网格质量不稳定，则优先使用 chart 内 geodesic KNN。
+
+\subsection{B.4 关于 chart 图构造}
+
+层内 chart 图可按以下任一方式构造：
+
+\begin{itemize}[leftmargin=2em]
+    \item 只连接存在重叠的 chart；
+    \item 连接 geodesic 邻近的 chart；
+    \item 将“重叠关系”和“reference 坐标近邻关系”联合起来构图。
+\end{itemize}
+
+第一版中，推荐采用：
+\begin{quote}
+\textbf{重叠关系为主，reference 坐标近邻为辅。}
+\end{quote}
+
+%========================================================
+\section{附录C：第一版保守方案、增强方案与长期扩展的对照表}
+
+\begin{longtable}{p{3.2cm}p{4.2cm}p{4.2cm}p{3.2cm}}
+\toprule
+模块 & 第一版保守方案 & 增强方案 & 长期扩展 \\
+\midrule
+\endfirsthead
+\toprule
+模块 & 第一版保守方案 & 增强方案 & 长期扩展 \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+
+输入特征 &
+5个标量 + 2个向量 &
+加入更多局部物理量 &
+张量场/丛截面 \\
+
+等值层 &
+混合阈值，少量层数 &
+层数增加，阈值细化 &
+阈值自适应学习 \\
+
+FCLC 构造 &
+前沿 + \(S_2\) + \(S_R\) &
+更复杂质量函数 &
+可学习 atlas 生长 \\
+
+节点状态 &
+双状态机制 &
+重叠节点加权再编码 &
+分层记忆机制 \\
+
+局部 ES &
+几何块+标量块+向量块 &
+加入更高阶统计 &
+可学习结构字典 \\
+
+局部传播 &
+gate + attention bias &
+低秩动态核 &
+等变局部算子 \\
+
+层内传播 &
+reference FCLC + overlap 修正 &
+更复杂 pairwise 边结构 &
+多尺度 chart 图 \\
+
+层间传播 &
+法向投影 + attention &
+多候选投影上下文 &
+跨层拓扑变换建模 \\
+
+输出头 &
+shared MLP + head &
+局部能量贡献头 &
+更强物理约束头 \\
+
+损失 &
+Huber + 两类正则 &
+更强一致性正则 &
+生成式联合训练 \\
+\end{longtable}
+
+%========================================================
+\section{附录D：补充符号表}
+
+\begin{longtable}{p{3.2cm}p{10.2cm}}
+\toprule
+符号 & 含义 \\
+\midrule
+\endfirsthead
+\toprule
+符号 & 含义 \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+
+\(c_1\) & 每个连通分量上 FCLC atlas 生长的初始主种子点 \\
+\(\Omega_t\) & 当前 atlas 已覆盖区域 \\
+\(\mathcal F_t\) & 当前前沿边缘点集 \\
+\(N_2(b)\) & 边缘点 \(b\) 经二点函数诱导的参考邻域 \\
+\(E_b\) & 边缘点 \(b\) 的外向候选发起点集合 \\
+\(S_R(q;P)\) & 点 \(q\) 相对候选区域 \(P\) 的区域相容打分 \\
+\(Q(e)\) & 候选发起点 \(e\) 所对应 FCLC 的质量分数 \\
+\(u_{a,i}\) & 节点 \(x_{a,i}\) 在 FCLC \(P_a\) 局部 frame 下的二维坐标 \\
+\(ES_a^{\mathrm{local}}\) & FCLC 内部显式结构描述子 \\
+\(\tilde F_a^{\mathrm{local}}\) & FCLC 内部显式结构编码后的局部调制特征 \\
+\(ES_a^{\mathrm{intra\text{-}center}}\) & FCLC 相对于参考 chart 的层内全局显式结构描述子 \\
+\(\tilde F_a^{\mathrm{intra\text{-}center}}\) & 层内全局显式调制特征 \\
+\(O_{ab}\) & 两个同层 chart 的重叠点集 \\
+\(C_{ab}\) & overlap-context 表示 \\
+\(\Pi_{k\to k+1}\) & 第 \(k\) 层到第 \(k+1\) 层的点级法向投影对应 \\
+\(\tilde w_{a\leftarrow b}\) & 归一化后的层间方向性对应权重 \\
+\(e_{a\leftarrow b}^{\mathrm{inter}}\) & 层间边特征 \\
+\(\mathcal T_{\mathrm{init}}\) & 由全局节点状态初始化局部状态的操作 \\
+\(\mathcal T_{\mathrm{local\_msg}}\) & 一次 FCLC 内局部传播操作 \\
+\(\mathcal T_{\mathrm{chart\_encode}}\) & 由局部状态再编码为 chart 状态的操作 \\
+\(\mathcal T_{\mathrm{merge}}\) & 由多个局部状态回写到全局节点状态的操作 \\
+\(\mathcal T_{\mathrm{intra}}\) & 层内 chart 图传播操作 \\
+\(\mathcal T_{\mathrm{inter}}\) & 层间 chart 图传播操作 \\
+\(\mathcal B\) & 一个完整的 block \\
+\end{longtable}
+
+%========================================================
+\section{附录E：建议的最终章节整合顺序}
+
+若要把整份手册整理成最终统一稿，建议采用如下顺序：
+
+\begin{enumerate}[leftmargin=2em]
+    \item 引言：背景、动机、两阶段任务关系
+    \item 相关工作
+    \item 问题设定与整体符号体系
+    \item 网络输入对象、节点性质与保守方案
+    \item 多层等值流形构造与阈值策略
+    \item FCLC atlas 生成算法
+    \item FCLC 局部 frame、四块划分与 anchor/reference 逻辑
+    \item 节点双状态机制
+    \item FCLC 内显式结构 \(ES\)
+    \item \(ES\to \tilde F\) 与局部传播
+    \item FCLC 再编码
+    \item 层内传播
+    \item 层间传播
+    \item block 递归与双层反馈
+    \item 全局读出与输出头
+    \item 损失函数
+    \item 实验与消融
+    \item 风险与应对
+    \item 第二阶段生成任务衔接
+    \item 附录与符号表
+\end{enumerate}
+
+%========================================================
+\section{附录F：参考文献占位}
+
+\begin{thebibliography}{99}
+
+\bibitem{HK1964}
+P. Hohenberg and W. Kohn,
+\newblock Inhomogeneous Electron Gas,
+\newblock \emph{Phys. Rev.}, 136:B864--B871, 1964.
+
+\bibitem{KS1965}
+W. Kohn and L. J. Sham,
+\newblock Self-Consistent Equations Including Exchange and Correlation Effects,
+\newblock \emph{Phys. Rev.}, 140:A1133--A1138, 1965.
+
+\bibitem{Roweis2000LLE}
+S. T. Roweis and L. K. Saul,
+\newblock Nonlinear Dimensionality Reduction by Locally Linear Embedding,
+\newblock \emph{Science}, 290(5500):2323--2326, 2000.
+
+\bibitem{X3D2024}
+Shuofeng Sun, Yongming Rao, Jiwen Lu, and Haibin Yan,
+\newblock X-3D: Explicit 3D Structure Modeling for Point Cloud Recognition,
+\newblock arXiv preprint, 2024.
+
+\bibitem{EDBench2025}
+Hongxin Xiang et al.,
+\newblock EDBench: Large-Scale Electron Density Data for Molecular Modeling,
+\newblock arXiv preprint, 2025.
+
+\bibitem{ECloudGen2025}
+Odin Zhang et al.,
+\newblock ECloudGen: Leveraging Electron Clouds as a Latent Variable to Scale Up Structure-Based Molecular Design,
+\newblock \emph{Nature Computational Science}, 2025.
+
+\end{thebibliography}
+
+\end{document}
