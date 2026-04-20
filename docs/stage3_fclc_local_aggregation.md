@@ -429,13 +429,15 @@ packed 输出目录当前固定包含：
 
 职责：
 
-- 初始化共享节点双流状态
-- 初始化 local membership 双流状态
-- 从 local state 动态刷新 `ES_scalar / ES_vector`
-- 做 `ES -> \tilde F / p`
-- 做 local 消息传递
+- 接收外部传入的共享节点双流状态（`shared_state`，由 `ED2EBBlockStack._initialize_shared_state()` 在第一轮前初始化，后续轮次由上一 BBlock 传入）
+- 接收可选的上一 BBlock 的 chart 状态（`p_prev`，首轮为 None）
+- 初始化 local membership 双流状态（`T_init`，无学习参数）
+- 通过共享的 `ExplicitStructureEncoder` 刷新 `ES_scalar / ES_vector` 并生成调制特征与初始 chart 状态（若 `p_prev` 非 None，以残差方式叠加）
+- 做 local 消息传递（默认 2 步），每步后重新调用 `ExplicitStructureEncoder` 更新调制特征
 - merge 回共享节点状态
 - 输出 Stage 4-ready 接口
+
+> **注**：`shared_state` 的原始特征嵌入（`shared_scalar_in` / `shared_vector_in` MLP）只在 `ED2EBBlockStack` 中各保留一份，由 `_initialize_shared_state()` 在循环开始前调用一次。`FCLCLocalBlock` 本身不含这两个 MLP，也不负责原始特征初始化。
 
 输出字段：
 
@@ -451,13 +453,7 @@ packed 输出目录当前固定包含：
 - `Enc_g / Enc_s / Enc_v`
 - 三类 token 的 block-token attention
 - 输出双流 `mod_state` 与双流 `chart_state`
-
-#### `PseudoStage4Consumer`
-
-职责：
-
-- 不实现真正 Stage 4 主传播
-- 只验证 `p_next_local + intra_static_bundle + local_state_final + node_state_shared_next` 是否可以零重排消费
+- 权重在 `ED2EBBlockStack` 中只实例化一份，所有 K 个 BBlock 共享
 
 ### 脚本层
 
@@ -879,25 +875,6 @@ python scripts/smoke_stage3_local_forward.py \
 - batch 应支持：
   - `batch.pin_memory()`
   - `batch.to(device, non_blocking=True)`
-
----
-
-## 已实现但属于下一阶段的接口约束
-
-虽然本轮不实现真正的 Stage 4 主传播，但已经把与下一阶段有关的接口固定下来：
-
-- chart 图边集
-- overlap 边与共享 membership 对
-- reference chart
-- anchor 编码
-- chart 双流状态 `p_next_local`
-- zero-repack `intra_static_bundle`
-- packed 训练 cache 的字段与 slice 边界
-
-也就是说，下一阶段的主要工作不再是“重新谈接口”，而是：
-
-- 在当前 `p_next_local + intra_static_bundle` 之上实现真正的 intra-chart message passing
-- 再继续接层间传播
 
 ---
 

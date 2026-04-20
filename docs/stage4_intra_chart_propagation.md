@@ -21,7 +21,7 @@
 ## 在 B-Block 中的位置
 
 ```
-T_inter ∘ T_intra ∘ T_chart_encode ∘ (T_local_msg)³ ∘ T_init
+T_inter ∘ T_intra ∘ (T_chart_encode ∘ T_local_msg) × num_local_steps ∘ T_chart_encode ∘ T_init
                 ↑ 本文档
 ```
 
@@ -55,6 +55,14 @@ Stage 4 操作的是 chart 层；共享节点和 membership 状态只被 `Overla
 | `intra_geom_static` | float32 | `(A, 7)` | 每个 chart 相对其组参考 chart 的静态几何描述 |
 | `overlap_edge_to_chart_edge_index` | int64 | `(E_ov,)` | 每条 overlap 边在 `chart_graph_edge_index` 中的位置 |
 | `chart_frame_metadata["chart_to_ref"]` | int64 | `(A,)` | 每个 chart 对应其组参考 chart 的全局 chart 索引 |
+
+> **`chart_to_ref`（A,）与 `reference_chart_id`（G,）的关系**：
+> - `reference_chart_id[g]`：第 g 组的 medoid 的全局 chart 索引，共 G 个（每 level×component 一组）
+> - `chart_to_ref[a]`：chart a 所属组的 medoid 的全局 chart 索引，共 A 个
+>
+> 两者的值域相同（均为全局 chart 索引），但形状不同：`chart_to_ref` 是对每个 chart 的广播展开，
+> 而 `reference_chart_id` 是去重后的组级列表。等价关系：
+> `set(chart_to_ref.tolist()) == set(reference_chart_id.tolist())`
 
 ### `intra_geom_static` 7 维含义
 
@@ -185,10 +193,14 @@ p_a_in_ref    = _rotate_vectors(p_mid.vector, chart_frame, chart_frame[ref_idx])
 p_ref_in_ref  = p_mid.vector[ref_idx]
 diff_in_ref   = p_a_in_ref - p_ref_in_ref
 vec_es = cat([p_a_in_ref.flatten(1), p_ref_in_ref.flatten(1), diff_in_ref.flatten(1),
-              p_mid.vector.norm(-1), p_mid.vector[ref_idx].norm(-1),
-              (p_a_in_ref * p_ref_in_ref).sum(-1)])                # (A, 72)
+              _safe_norm(p_mid.vector),            # 替代 .norm(-1)
+              _safe_norm(p_mid.vector[ref_idx]),
+              (p_a_in_ref * p_ref_in_ref).sum(-1)])   # (A, 72)
 
-F̃ = es_encoder(intra_static["intra_geom_static"], scalar_es, vec_es)  # (A, 96)
+# intra_geom_static per-chart 最大值归一化，防止极端物理量（e.g. 大分子 d_M）导致 LayerNorm 方差坍塌
+geom_intra = intra_static["intra_geom_static"]
+g_scale    = geom_intra.abs().amax(dim=-1, keepdim=True).clamp_min(1.0)
+F̃ = es_encoder(geom_intra / g_scale, scalar_es, vec_es)  # (A, 96)
 ```
 
 **Step 3 — 主消息**
@@ -228,7 +240,7 @@ m_a_v = _scatter_add(m_v, dst, A)   # (A, 8, 2)
 **Step 6 — 更新**
 
 ```python
-delta_s = mlp_update_s(cat([p_mid.scalar, m_a_s, m_a_v.norm(-1)]))
+delta_s = mlp_update_s(cat([p_mid.scalar, m_a_s, _safe_norm(m_a_v)]))
 p_bar_s = scalar_update_norm(p_mid.scalar + delta_s)
 
 gate_v  = sigmoid(mlp_vgate(cat([p_mid.scalar, m_a_s]))).unsqueeze(-1)

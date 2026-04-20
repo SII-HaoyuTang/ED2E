@@ -132,6 +132,9 @@ def _parse_args() -> argparse.Namespace:
                         "With 500 GB RAM, 15000–20000 is safe.")
     p.add_argument("--max-samples", type=int, default=None)
     p.add_argument("--chunksize", type=int, default=4)
+    p.add_argument("--resume", action="store_true",
+                   help="Resume an interrupted run: skip mol_ids already written "
+                        "in existing shard directories under --packed-dir.")
     return p.parse_args()
 
 
@@ -172,7 +175,16 @@ def main() -> None:
     )
     print(f"Discovered {len(mol_ids)} molecules from Stage 1 source.")
 
-    writer = Stage3ShardedWriter(args.packed_dir, shard_size=args.shard_size)
+    writer = Stage3ShardedWriter(args.packed_dir, shard_size=args.shard_size,
+                                 resume=args.resume)
+    if args.resume:
+        done_set = writer.done_mol_ids()
+        if done_set:
+            mol_ids = [m for m in mol_ids if m not in done_set]
+            print(f"Resume: {len(done_set)} already written "
+                  f"({writer._shard_idx} shard(s)), {len(mol_ids)} remaining.")
+        else:
+            print("Resume: no existing shards found, starting fresh.")
 
     counts: defaultdict = defaultdict(int)
     proc_times: List[float] = []

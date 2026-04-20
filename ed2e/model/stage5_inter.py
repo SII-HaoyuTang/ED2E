@@ -20,6 +20,7 @@ from ed2e.data.stage3_local import Stage3TensorBatch
 from ed2e.model.stage3_local import (
     DualStreamState,
     _MLP,
+    _safe_norm,
     _scatter_add,
     _segment_softmax,
 )
@@ -95,6 +96,8 @@ class InterLevelBlock(nn.Module):
 
         # Step 2: edge feature encoding
         e_ab = inter_static["inter_level_edge_attr"]      # (E, 7)
+        e_scale = e_ab.abs().amax(dim=-1, keepdim=True).clamp_min(1.0)
+        e_ab = e_ab / e_scale                              # (E, 7), values in [-1, 1]
         F_e  = self.enc_e(e_ab)                           # (E, 96)
 
         # z_ab: [p̄_dst^s, p̄_src^s, F_e, p̄_dst^s − p̄_src^s, p̄_dst^s ⊙ p̄_src^s]
@@ -129,7 +132,7 @@ class InterLevelBlock(nn.Module):
 
         # Step 6: update
         delta_s = self.mlp_update_s(
-            torch.cat([p_bar.scalar, m_a_s, m_a_v.norm(dim=-1)], dim=-1)
+            torch.cat([p_bar.scalar, m_a_s, _safe_norm(m_a_v)], dim=-1)
         )                                                  # (A, 64)
         p_new_s = self.scalar_update_norm(p_bar.scalar + delta_s)
 

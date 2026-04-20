@@ -671,15 +671,59 @@ class Stage3ShardedWriter:
     After ``finalize()``, the root directory contains a ``manifest.json`` listing
     all shard subdirectories.  ``Stage3PackedDataset`` will detect this manifest
     and present a merged view across all shards.
+
+    Resume support
+    --------------
+    Pass ``resume=True`` to re-open an interrupted run.  The writer scans
+    ``root`` for existing complete shards (``shard_0000/``, ``shard_0001/``,
+    …) and skips over them.  Call ``done_mol_ids()`` before starting the
+    worker loop to filter out already-processed molecules::
+
+        writer = Stage3ShardedWriter(root, shard_size=2000, resume=True)
+        done = writer.done_mol_ids()
+        remaining = [m for m in all_mol_ids if m not in done]
+        for mol_id in remaining:
+            writer.put(build_stage3_sample(...))
+        writer.finalize()   # manifest covers old + new shards
     """
 
-    def __init__(self, root: str, shard_size: int = 2000) -> None:
+    def __init__(self, root: str, shard_size: int = 2000, resume: bool = False) -> None:
         self.root = root
         self.shard_size = shard_size
         self._buf: List[Stage3Sample] = []
-        self._shard_idx = 0
-        self._shard_dirs: List[str] = []
         os.makedirs(root, exist_ok=True)
+
+        if resume:
+            # Scan for consecutive complete shards already on disk.
+            # Stop at the first gap (missing or incomplete shard).
+            existing: List[str] = []
+            idx = 0
+            while True:
+                d = os.path.join(root, f"shard_{idx:04d}")
+                if os.path.isdir(d) and is_stage3_packed_dir(d):
+                    existing.append(d)
+                    idx += 1
+                else:
+                    break
+            self._shard_dirs = existing
+            self._shard_idx = idx
+        else:
+            self._shard_dirs = []
+            self._shard_idx = 0
+
+    def done_mol_ids(self) -> "set[str]":
+        """Return the set of mol_ids already stored in completed shards.
+
+        Call this after constructing with ``resume=True`` and before
+        starting the processing loop to determine which molecules can be
+        skipped.
+        """
+        done: set = set()
+        for shard_dir in self._shard_dirs:
+            with np.load(stage3_packed_index_path(shard_dir), allow_pickle=False) as idx:
+                for mol_id in idx["mol_ids"].tolist():
+                    done.add(str(mol_id))
+        return done
 
     def put(self, sample: Stage3Sample) -> None:
         self._buf.append(sample)

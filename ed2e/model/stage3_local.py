@@ -14,6 +14,16 @@ from ed2e.data.stage3_local import Stage3TensorBatch
 _EPS = 1e-8
 
 
+def _safe_norm(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """L2 norm along dim with epsilon inside sqrt for stable backpropagation.
+
+    Plain .norm() has gradient x/||x|| which is NaN at ||x||=0.
+    This version computes sqrt(sum(x^2) + eps) so gradient is x/sqrt(sum(x^2)+eps),
+    finite everywhere.
+    """
+    return (x.pow(2).sum(dim=dim) + _EPS).sqrt()
+
+
 @dataclass
 class DualStreamState:
     scalar: torch.Tensor
@@ -149,21 +159,24 @@ class ExplicitStructureEncoder(nn.Module):
 class FCLCLocalBlock(nn.Module):
     """Stage 3 local block whose outputs directly match Stage 4 input needs."""
 
-    def __init__(self, cfg: Optional[Stage3LocalConfig] = None) -> None:
+    def __init__(
+        self,
+        cfg: Optional[Stage3LocalConfig] = None,
+        structure_encoder: Optional["ExplicitStructureEncoder"] = None,
+    ) -> None:
         super().__init__()
         self.cfg = cfg or Stage3LocalConfig()
 
         scalar_es_dim = self.cfg.scalar_dim * 10
         vector_es_dim = self.cfg.vector_dim * 22
 
-        self.shared_scalar_in = _MLP(self.cfg.raw_scalar_dim, self.cfg.scalar_dim, self.cfg.scalar_dim)
-        self.shared_vector_in = _MLP(
-            self.cfg.raw_vector_channels * 2,
-            self.cfg.token_dim,
-            self.cfg.vector_dim * 2,
-        )
-
-        self.structure_encoder = ExplicitStructureEncoder(self.cfg, scalar_es_dim, vector_es_dim)
+        # structure_encoder is shared across all BBlocks; created externally and passed in.
+        if structure_encoder is not None:
+            self.structure_encoder = structure_encoder
+        else:
+            # Fallback: create a local instance (used when FCLCLocalBlock is instantiated
+            # standalone, e.g. in smoke tests or PseudoStage4Consumer contexts).
+            self.structure_encoder = ExplicitStructureEncoder(self.cfg, scalar_es_dim, vector_es_dim)
 
         msg_in_dim = self.cfg.scalar_dim + self.cfg.vector_dim + self.cfg.edge_attr_dim
         self.scalar_msg = _MLP(msg_in_dim, self.cfg.token_dim, self.cfg.scalar_dim)
@@ -189,12 +202,6 @@ class FCLCLocalBlock(nn.Module):
         )
         self.shared_scalar_merge_norm = nn.LayerNorm(self.cfg.scalar_dim)
         self.shared_vector_merge_gate = _MLP(self.cfg.scalar_dim * 2, self.cfg.token_dim, self.cfg.vector_dim)
-
-    def initialize_shared_state(self, batch: Stage3TensorBatch) -> DualStreamState:
-        scalar = self.shared_scalar_in(batch.node_scalar_raw)
-        raw_vec_2d = _project_vectors(batch.node_vector_raw, batch.node_tangent_basis)
-        vector = self.shared_vector_in(raw_vec_2d.flatten(start_dim=1)).view(-1, self.cfg.vector_dim, 2)
-        return DualStreamState(scalar=scalar, vector=vector)
 
     def init_local_state(self, batch: Stage3TensorBatch, shared_state: DualStreamState) -> DualStreamState:
         node_idx = batch.chart_membership[:, 1]
@@ -233,8 +240,8 @@ class FCLCLocalBlock(nn.Module):
             [
                 shared_prev.scalar,
                 merged_scalar,
-                shared_prev.vector.norm(dim=-1),
-                merged_vector.norm(dim=-1),
+                _safe_norm(shared_prev.vector),
+                _safe_norm(merged_vector),
             ],
             dim=-1,
         )
@@ -279,7 +286,7 @@ class FCLCLocalBlock(nn.Module):
                 )
                 vector_means.append(vec_mean_q)
 
-                vec_norm_q = _scatter_mean(vec_q.norm(dim=-1), idx_q, num_charts)
+                vec_norm_q = _scatter_mean(_safe_norm(vec_q), idx_q, num_charts)
                 vector_norms.append(vec_norm_q)
 
                 vec_disp_q = _scatter_mean(
@@ -331,7 +338,14 @@ class FCLCLocalBlock(nn.Module):
         local_state: DualStreamState,
     ) -> Tuple[DualStreamState, DualStreamState, Dict[str, torch.Tensor]]:
         scalar_es, vector_es = self.compute_dynamic_es(batch, local_state)
-        out = self.structure_encoder(batch.chart_es_geom_static, scalar_es, vector_es)
+        # Normalise per-chart: extreme values in chart_es_geom_static (e.g. curvature-
+        # derived features for sharp density regions) cause enc_g outputs to overflow
+        # and can collapse LayerNorm variance → NaN inside ExplicitStructureEncoder.
+        geom_scale = (
+            batch.chart_es_geom_static.abs().amax(dim=-1, keepdim=True).clamp_min(1.0)
+        )
+        geom_norm = batch.chart_es_geom_static / geom_scale
+        out = self.structure_encoder(geom_norm, scalar_es, vector_es)
         mod_state = DualStreamState(out["mod_scalar"], out["mod_vector"])
         chart_state = DualStreamState(out["chart_scalar"], out["chart_vector"])
         debug = {
@@ -359,8 +373,10 @@ class FCLCLocalBlock(nn.Module):
         dst_scalar = local_state.scalar[dst]
         src_vector = local_state.vector[src]
         edge_attr = batch.local_edge_attr
+        edge_scale = edge_attr.abs().amax(dim=-1, keepdim=True).clamp_min(1.0)
+        edge_attr = edge_attr / edge_scale    # (E_loc, 6), values in [-1, 1]
 
-        src_vec_norm = src_vector.norm(dim=-1)
+        src_vec_norm = _safe_norm(src_vector)
         msg_in = torch.cat([src_scalar, src_vec_norm, edge_attr], dim=-1)
         base_scalar = self.scalar_msg(msg_in)
         scalar_gate = torch.sigmoid(self.chart_scalar_gate(mod_state.scalar[dst_chart]))
@@ -381,7 +397,7 @@ class FCLCLocalBlock(nn.Module):
             [
                 local_state.scalar,
                 scalar_agg,
-                vector_agg.norm(dim=-1),
+                _safe_norm(vector_agg),
                 mod_state.scalar[local_chart],
             ],
             dim=-1,
@@ -401,22 +417,38 @@ class FCLCLocalBlock(nn.Module):
         self,
         batch: Stage3TensorBatch,
         *,
-        shared_state: Optional[DualStreamState] = None,
+        shared_state: DualStreamState,
+        p_prev: Optional[DualStreamState] = None,
         return_debug: bool = False,
     ) -> Dict[str, Any]:
-        shared_prev = shared_state or self.initialize_shared_state(batch)
-        local_state = self.init_local_state(batch, shared_prev)
+        local_state = self.init_local_state(batch, shared_state)
 
         mod_state, chart_state, debug0 = self.encode_structure(batch, local_state)
+
+        # If a chart state from the previous BBlock is available, use it as the
+        # starting point (residual addition) so chart information accumulates
+        # across BBlock iterations.
+        if p_prev is not None:
+            chart_state = DualStreamState(
+                scalar=p_prev.scalar + chart_state.scalar,
+                vector=p_prev.vector + chart_state.vector,
+            )
+            mod_state = chart_state
+
         debug_steps: List[Dict[str, torch.Tensor]] = [debug0] if return_debug else []
 
         for _ in range(self.cfg.num_local_steps):
             local_state = self.local_message_step(batch, local_state, mod_state)
-            mod_state, chart_state, debug_step = self.encode_structure(batch, local_state)
+            mod_state, chart_delta, debug_step = self.encode_structure(batch, local_state)
+            # Accumulate chart state across local steps (residual).
+            chart_state = DualStreamState(
+                scalar=chart_state.scalar + chart_delta.scalar,
+                vector=chart_state.vector + chart_delta.vector,
+            )
             if return_debug:
                 debug_steps.append(debug_step)
 
-        shared_next = self.merge_shared_state(batch, shared_prev, local_state)
+        shared_next = self.merge_shared_state(batch, shared_state, local_state)
         out = {
             "node_state_shared_next": shared_next,
             "local_state_final": local_state,
@@ -511,7 +543,7 @@ class PseudoStage4Consumer(nn.Module):
                     p_next_local.scalar,
                     chart_scalar_agg,
                     overlap_scalar_agg,
-                    p_next_local.vector.norm(dim=-1),
+                    _safe_norm(p_next_local.vector),
                 ],
                 dim=-1,
             )
@@ -534,6 +566,9 @@ class PseudoStage4Consumer(nn.Module):
 __all__ = [
     "DualStreamState",
     "Stage3LocalConfig",
+    "ExplicitStructureEncoder",
     "FCLCLocalBlock",
     "PseudoStage4Consumer",
+    "_MLP",
+    "_project_vectors",
 ]

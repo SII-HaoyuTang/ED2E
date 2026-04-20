@@ -125,10 +125,12 @@ mol_EDthresh0.05_data.pkl  +  ed_energy_5w.csv
          │
          └── ED2EModel.forward(batch)
                ├── ED2EBBlockStack × K（默认 K=3）
-               │     每轮 B-Block：
-               │       T_init（node → chart 初始化）
-               │       T_local_msg × 3（FCLC 内消息传递）
-               │       T_chart_encode（chart state 编码）
+               │     初始化（仅一次）：
+               │       原始节点特征嵌入 → shared_state (N, 80)
+               │     每轮 B-Block（shared_state 和 p_prev 跨轮传递）：
+               │       T_init（shared_state → local chart 状态）
+               │       ExplicitStructureEncoder（共享权重，ES → 调制特征）
+               │       T_local_msg × num_local_steps（FCLC 内消息传递，默认 2 步）
                │       T_intra（层内 chart 图，IntraLevelBlock）
                │       T_inter（层间 chart 图，InterLevelBlock）
                ├── MultiHeadChartReadout（6目标 × 4 head 交叉注意力）
@@ -158,24 +160,32 @@ mol_EDthresh0.05_data.pkl  +  ed_energy_5w.csv
 | `inter_level_weights` | (E_inter,) | 跨层方向权重（counting-based） |
 | `node_batch` / `chart_batch` | (N/A_total,) | 批次索引 |
 
-### B-Block 迭代（K 轮，权重独立）
+### B-Block 迭代（K 轮，消息传递权重独立，结构编码器共享）
 
-每轮按以下顺序执行：
+初始化（仅在第 1 轮前执行一次）：原始物理节点特征嵌入 → `shared_state`
+
+每轮按以下顺序执行，`shared_state`（节点级）和 `p_prev`（chart 级）跨轮传递：
 
 ```
-shared_state（N, 64+8×2）— 跨轮传递
+shared_state（N, 64+8×2）+ p_prev（A, 64+8×2）— 跨轮传递
     │
-    ▼ FCLCLocalBlock（T_init + T_local_msg × 3 + T_chart_encode）
-    │   node_state_shared_next (N, 80)
-    │   local_state_final      (N_M, ...)
-    │   p_next_local           (A, 80)    ← chart 标量(64) + 向量(8×2)
+    ▼ FCLCLocalBlock
+    │   T_init：shared_state → local chart 状态
+    │   ExplicitStructureEncoder（共享权重）：ES → 调制特征 + chart 状态起点
+    │   p_prev 残差叠加（若非首轮）
+    │   T_local_msg × num_local_steps（默认 2 步，每步后刷新 ES 编码）
+    │   → node_state_shared_next (N, 80)
+    │   → local_state_final      (N_M, ...)
+    │   → p_next_local           (A, 80)    ← chart 标量(64) + 向量(8×2)
     │
     ▼ IntraLevelBlock（T_intra）
     │   p_bar  (A, 80)  — 层内 chart 图消息传递后
     │
     ▼ InterLevelBlock（T_inter）
-        p_new  (A, 80)  — 跨层传播后，传入下一轮 B-Block
+        p_new  (A, 80)  — 跨层传播后，作为 p_prev 传入下一轮 B-Block
 ```
+
+> **Gradient Checkpointing**：`BBlockConfig.use_gradient_checkpointing=True`（默认开启）在训练时用 `torch.utils.checkpoint` 重算各 BBlock 激活，以约 10% 额外计算换取 ~35% 显存节省，可在相同 GPU 上将 per-GPU batch size 翻倍。推理时自动关闭。
 
 ### 读出与能量头
 
@@ -224,49 +234,132 @@ p_new (A, 80)
 
 ```bash
 pip install torch numpy scikit-learn "scikit-image>=0.19" "scipy>=1.7" numba tqdm
-pip install plotly  # 可选，仅可视化需要
+pip install wandb plotly  # 可选：wandb 训练监控；plotly 可视化
 ```
 
-### 6.2 端到端预处理（一条命令）
+---
+
+### 6.2 端到端预处理
+
+**文件**：`scripts/preprocess_edbench.py`
 
 ```bash
 python scripts/preprocess_edbench.py \
-    --pkl  data/ed_energy_5w/processed/mol_EDthresh0.05_data.pkl \
-    --csv  data/ed_energy_5w/raw/ed_energy_5w.csv \
+    --pkl      data/ed_energy_5w/processed/mol_EDthresh0.05_data.pkl \
+    --csv      data/ed_energy_5w/raw/ed_energy_5w.csv \
     --data-dir data/ed_energy_5w \
-    --workers 8
+    --workers  8
 ```
 
-输出目录结构：
+**必填参数**
+
+| 参数 | 说明 |
+|------|------|
+| `--pkl` | 原始 PKL 文件路径（mol_EDthresh0.05_data.pkl，~9 GB） |
+| `--csv` | 能量标签 CSV 路径（ed_energy_5w.csv） |
+| `--data-dir` | 输出根目录（cache_manifold/、packed_stage3/ 等自动创建于此） |
+
+**跳过与续算**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--skip-stage1` | False | 跳过 Stage 1（当 `cache_manifold/all_nl*.pkl` 已存在时自动跳过） |
+| `--skip-stage23` | False | 跳过 Stage 2+3（当 `packed_stage3/manifest.json` 已存在时自动跳过） |
+
+Stage 2+3 支持中断续算：若 `packed_stage3/` 下已有 `shard_0000/` 等完整分片，重新运行时会自动跳过已完成的分子，从断点继续写入新分片。
+
+**并行控制**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--workers` | `cpu_count // 4` | 进程数 |
+| `--threads-per-proc` | 4 | 每进程内部线程数（Stage 2+3） |
+| `--chunksize` | 4 | `imap_unordered` 批量大小 |
+| `--shard-size` | 2000 | 每个 packed shard 最大分子数 |
+
+**数据量控制**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--max-samples` | None | 限制处理分子数（测试用） |
+
+**Stage 1 参数**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--n-levels` | 4 | 等密度层数（百分位阈值数） |
+| `--smooth-sigma` | 0.5 | 密度场 Gaussian 预平滑 σ（Bohr） |
+| `--min-component-size` | 10 | 最小连通分量顶点数 |
+
+**Stage 2+3 参数**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--tau-r` | 1.0 | chart 半径阈值（Bohr），控制 chart 大小 |
+| `--tau-2` | 1.5 | 二阶候选邻居半径倍数 |
+| `--local-knn-k` | 12 | chart 内 KNN 图的 K |
+| `--chart-knn-k` | 8 | 同层 chart 图的 K |
+| `--num-anchors` | 8 | 每个 chart 的 anchor 点数 |
+| `--mem-thresh` | None | 预计算全量测地距离矩阵的最大顶点数。高值以 RAM 换速度（消除逐 Dijkstra 调用）；500 GB 内存下建议 15000–20000 |
+
+**Split 参数**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--split-col` | `scaffold_split` | CSV 中用于划分的列名（`scaffold_split` 或 `random_split`） |
+
+**输出目录结构**
 
 ```
 data/ed_energy_5w/
-├── cache_manifold/all_nl4_s0.50.pkl   ← Stage 1
-├── packed_stage3/                      ← Stage 3 packed（分片）
+├── cache_manifold/all_nl4_s0.50.pkl   ← Stage 1 合并缓存
+├── packed_stage3/                      ← Stage 2+3 packed（分片）
 │   ├── manifest.json
 │   ├── shard_0000/
 │   └── ...
-├── split.json                          ← scaffold_split 划分
+├── split.json                          ← train/val/test mol_id 列表
 └── energy_stats.json                   ← 训练集能量 z-score 统计量
 ```
 
-可选参数：
+---
+
+### 6.3 单独运行 Stage 2+3（已有 Stage 1 缓存）
+
+**文件**：`scripts/preprocess_stage2_to_packed.py`
 
 ```bash
-# 快速冒烟测试（前 200 个分子）
-python scripts/preprocess_edbench.py ... --max-samples 200
-
-# 跳过已完成的 Stage 1（恢复运行）
-python scripts/preprocess_edbench.py ... --skip-stage1
-
-# 调整超参数
-python scripts/preprocess_edbench.py ... \
-    --n-levels 4 --smooth-sigma 0.5 \
-    --tau-r 1.0 --tau-2 1.5 \
-    --local-knn-k 12 --chart-knn-k 8 --num-anchors 8
+python scripts/preprocess_stage2_to_packed.py \
+    --manifold-pkl data/ed_energy_5w/cache_manifold/all_nl4_s0.50.pkl \
+    --packed-dir   data/ed_energy_5w/packed_stage3 \
+    --workers 8 --mem-thresh 15000
 ```
 
-### 6.3 预处理质量分析
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--manifold-pkl` | — | 合并的 Stage 1 PKL（与 `--manifold-cache-dir` 二选一） |
+| `--manifold-cache-dir` | — | Stage 1 逐分子缓存目录（与 `--manifold-pkl` 二选一） |
+| `--packed-dir` | 必填 | 输出 packed 目录 |
+| `--shard-size` | 2000 | 每个 shard 最大分子数 |
+| `--workers` | `cpu_count // 4` | 进程数 |
+| `--threads-per-proc` | 4 | 每进程内部线程数 |
+| `--parallel-mode` | `process` | 并行模式（`process` 或 `thread`） |
+| `--n-levels` | 4 | Stage 1 层数（用于定位逐分子缓存文件名） |
+| `--smooth-sigma` | 0.5 | Stage 1 平滑 σ（同上） |
+| `--tau-r` | 1.0 | chart 半径阈值 |
+| `--tau-2` | 1.5 | 二阶邻居半径倍数 |
+| `--local-knn-k` | 12 | chart 内 KNN K |
+| `--chart-knn-k` | 8 | 同层 chart 图 K |
+| `--num-anchors` | 8 | anchor 点数 |
+| `--mem-thresh` | None | 测地距离矩阵预计算阈值 |
+| `--max-samples` | None | 限制分子数 |
+| `--chunksize` | 4 | imap 批量大小 |
+| `--resume` | False | 续算：跳过 packed_dir 中已写入的分子 |
+
+---
+
+### 6.4 预处理质量分析
+
+**文件**：`scripts/analyze_preprocessing.py`
 
 ```bash
 python scripts/analyze_preprocessing.py \
@@ -280,58 +373,166 @@ python scripts/analyze_preprocessing.py \
     --quick-check --n-mols 200
 ```
 
-分析输出：`summary_stats.json`、`per_mol_stats.csv`、`flagged_mols.json`，以及 11 项分布直方图和交互式 3D chart 图。
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--packed-dir` | 必填 | packed_stage3 目录 |
+| `--out-dir` | `<packed-dir>/../preprocess_analysis` | 输出目录 |
+| `--n-mols` | 500 | 分析的分子数（随机采样） |
+| `--plot-mols` | — | 指定生成 3D chart-graph HTML 的 mol_id 列表 |
+| `--quick-check` | False | 仅运行 Pass/Fail 检查，跳过所有图表 |
+| `--seed` | 42 | 随机采样种子 |
 
-### 6.4 前向冒烟测试
+输出：`summary_stats.json`、`per_mol_stats.csv`、`flagged_mols.json`，以及 11 项分布直方图和交互式 3D chart 图。
+
+---
+
+### 6.5 前向冒烟测试
+
+**文件**：`scripts/smoke_stage6_forward.py`
 
 ```bash
-# 完整模型端到端验证（CPU，4 个分子，1 个 B-Block）
 python scripts/smoke_stage6_forward.py \
     --packed-dir data/ed_energy_5w/packed_stage3 \
     --n-mols 4 --device cpu --num-bblocks 1
 ```
 
-验证项：`energy_pred.shape == (4, 6)`，无 NaN/Inf，注意力权重之和为 1。
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--packed-dir` | 必填 | packed_stage3 目录 |
+| `--n-mols` | 4 | 测试分子数 |
+| `--device` | `cpu` | 运行设备 |
+| `--num-bblocks` | 1 | B-Block 数（快速测试用 1） |
 
-### 6.5 训练 ED2E 模型
+验证项：`energy_pred.shape == (B, 6)`，无 NaN/Inf，每分子每目标每 head 注意力之和为 1。
+
+---
+
+### 6.6 训练 ED2E 模型
+
+**文件**：`scripts/train.py`
+
+支持单卡和多卡 DDP 两种方式，自动检测 `LOCAL_RANK` 环境变量（由 `torchrun` 注入）。
+
+#### 单卡训练
 
 ```bash
 python scripts/train.py \
     --data-dir  data/ed_energy_5w \
     --csv-path  data/ed_energy_5w/raw/ed_energy_5w.csv \
     --out-dir   runs/ed2e_k3 \
-    --num-bblocks 3 \
-    --batch-size 8 \
-    --epochs 100 \
-    --device cuda
+    --num-bblocks 3 --batch-size 8 --epochs 100 --device cuda \
+    --num-workers 4 \
+    --wandb --wandb-project ed2e --wandb-run-name k3_v1
 ```
 
-主要参数：
+#### 多卡 DDP（推荐，8× H200）
+
+```bash
+torchrun --nproc_per_node=8 scripts/train.py \
+    --data-dir  data/ed_energy_5w \
+    --csv-path  data/ed_energy_5w/raw/ed_energy_5w.csv \
+    --out-dir   runs/ed2e_ddp \
+    --num-bblocks 3 --batch-size 8 --grad-accum 2 \
+    --epochs 100 --num-workers 4 \
+    --wandb --wandb-project ed2e --wandb-run-name ddp_k3_v1
+# 等效 batch = 8 × 8 × 2 = 128
+# bf16 AMP 和 gradient checkpointing 默认开启
+```
+
+#### 断点续训
+
+```bash
+# 单卡
+python scripts/train.py ... --resume runs/ed2e_k3/last.pt
+
+# 多卡
+torchrun --nproc_per_node=8 scripts/train.py ... --resume runs/ed2e_ddp/last.pt
+```
+
+**必填参数**
+
+| 参数 | 说明 |
+|------|------|
+| `--data-dir` | 数据根目录（含 packed_stage3/、split.json、energy_stats.json） |
+| `--csv-path` | 能量标签 CSV 路径 |
+| `--out-dir` | Checkpoint 和日志输出目录 |
+
+**模型结构**
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--num-bblocks` | 3 | B-Block 迭代轮数 |
-| `--batch-size` | 8 | 批次大小 |
-| `--lr` | 1e-3 | 学习率 |
-| `--weight-decay` | 1e-4 | AdamW 权重衰减 |
-| `--epochs` | 100 | 训练轮数 |
-| `--device` | cpu | 训练设备 |
-| `--resume` | — | 断点续训路径 |
+| `--num-bblocks` | 3 | B-Block 迭代轮数 K |
+| `--num-heads` | 4 | 读出层多头注意力头数 |
+| `--head-hidden` | 128 | EnergyHead MLP 隐层维度 |
+| `--dropout` | 0.1 | EnergyHead Dropout 率 |
 
-Checkpoint 格式：
+**训练超参数**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--batch-size` | 8 | 每 GPU 批次大小 |
+| `--epochs` | 100 | 训练轮数 |
+| `--lr` | 1e-3 | AdamW 学习率 |
+| `--weight-decay` | 1e-4 | AdamW 权重衰减 |
+| `--grad-accum` | 1 | 梯度累积步数（等效 batch = batch_size × GPUs × N） |
+| `--num-workers` | 4 | 每进程 DataLoader 工作进程数 |
+| `--device` | `cuda` | 单卡模式设备（DDP 时由 torchrun 管理，无需指定） |
+| `--resume` | — | 续训 checkpoint 路径（`.pt` 文件） |
+| `--log-every` | 50 | 每 N 个 optimizer step 打印一次 step-level 损失 |
+
+**精度与显存**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--no-amp` | False | 禁用 bf16 AMP（默认开启，仅 CUDA 有效） |
+
+> Gradient Checkpointing 由 `BBlockConfig.use_gradient_checkpointing`（默认 `True`）控制，训练时自动启用，无需命令行参数。
+
+**W&B 监控**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--wandb` | False | 启用 Weights & Biases（需 `pip install wandb`） |
+| `--wandb-project` | `ed2e` | W&B 项目名 |
+| `--wandb-entity` | — | W&B 团队/用户名 |
+| `--wandb-run-name` | out-dir 末段 | Run 名称 |
+| `--wandb-tags` | — | 空格分隔的标签列表 |
+
+W&B 额外记录：`grad_accum`、`effective_batch`（= batch_size × world_size × grad_accum）、`amp`、`grad_checkpointing`、`world_size`。
+
+**DDP 注意事项**
+
+- 由 `torchrun` 启动时自动检测 `LOCAL_RANK`，初始化 NCCL 进程组
+- Checkpoint、日志和 W&B 只在 **rank 0** 进程执行
+- Validation 只在 **rank 0** 运行（避免重复统计）
+- 需要 `/dev/shm` ≥ 4–8 GB（Docker 容器默认 64 MB 需手动扩容：`--shm-size=8g`）
+
+**Checkpoint 格式**
 
 ```python
 {
-    "config":     ED2EConfig,       # dataclass
-    "state_dict": model.state_dict(),
-    "norm_mean":  np.ndarray (6,),  # 训练集能量均值
+    "config":     ED2EConfig,          # dataclass，含完整超参数
+    "state_dict": model.state_dict(),  # 原始模型权重（非 DDP 包装）
+    "norm_mean":  np.ndarray (6,),     # 训练集能量均值
     "norm_std":   np.ndarray (6,),
     "epoch":      int,
-    "val_mae":    np.ndarray (6,),  # per-target MAE（Hartree）
+    "val_mae":    np.ndarray (6,),     # per-target MAE（Hartree）
 }
 ```
 
-### 6.6 注意力可视化
+加载：
+```python
+ckpt  = torch.load("best.pt", map_location="cpu")
+model = ED2EModel(ckpt["config"])
+model.load_state_dict(ckpt["state_dict"])
+norm_stats = {"mean": ckpt["norm_mean"], "std": ckpt["norm_std"]}
+```
+
+---
+
+### 6.7 注意力可视化
+
+**文件**：`scripts/visualize_attention.py`
 
 ```bash
 python scripts/visualize_attention.py \
@@ -341,13 +542,22 @@ python scripts/visualize_attention.py \
     --out-dir  figs/attention
 ```
 
-输出每个分子每个能量目标的交互式 3D chart 散点图（颜色 = 注意力权重），以及 `attention_data.csv` 和 `attn_by_level.png`。
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--checkpoint` | 必填 | 训练好的 `.pt` checkpoint 路径 |
+| `--packed-dir` | 必填 | packed_stage3 目录 |
+| `--out-dir` | 必填 | 输出目录 |
+| `--mol-ids` | — | 指定 mol_id 列表（与 `--n-mols` 互斥） |
+| `--n-mols` | — | 取前 N 个分子（与 `--mol-ids` 互斥） |
+| `--device` | `cpu` | 运行设备 |
+
+输出：每分子每目标的交互式 3D chart 散点图（颜色 = 注意力权重）、`attention_data.csv`、`attn_by_level.png`。
 
 ---
 
 ## 7. FCLC 超参数消融
 
-通过扫描 `(tau_r, tau_2)` 网格来确定 chart 大小的最优配置：
+**文件**：`scripts/ablate_fclc_chart_size.py`
 
 ```bash
 python scripts/ablate_fclc_chart_size.py \
@@ -356,7 +566,16 @@ python scripts/ablate_fclc_chart_size.py \
     --output-csv data/fclc_ablation.csv
 ```
 
-输出 `fclc_ablation.csv`：每行一种 `(tau_r, tau_2)` 组合，记录 chart 数量均值/标准差、chart 大小分布、覆盖率等统计量。
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--manifold-pkl` | 必填 | 合并的 Stage 1 manifold PKL |
+| `--n-mols` | 50 | 使用的分子数（取前 N 个，确定性） |
+| `--tau-r` | `0.5 0.75 1.0 1.25 1.5` | 扫描的 tau_r 值列表（空格分隔） |
+| `--tau-2` | `1.0 1.5 2.0` | 扫描的 tau_2 值列表（空格分隔） |
+| `--min-chart-size` | 5 | 最小 chart 大小过滤阈值 |
+| `--output-csv` | `fclc_ablation.csv` | 输出 CSV 路径 |
+
+输出 CSV 每行一种 `(tau_r, tau_2)` 组合，记录 chart 数量均值/标准差、chart 大小分布、覆盖率等。
 
 ---
 

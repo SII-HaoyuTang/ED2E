@@ -243,7 +243,11 @@ def _run_stage23(
     chunksize: int,
     mem_thresh: Optional[int] = None,
 ) -> None:
-    """Run Stage 2+3 pipeline, write to packed_dir."""
+    """Run Stage 2+3 pipeline, write to packed_dir.
+
+    Supports resumption: if packed_dir already contains complete shards from a
+    previous interrupted run, those molecules are skipped automatically.
+    """
     from ed2e.data.stage3_packed import Stage3ShardedWriter
 
     global _s23_manifold_merged, _s23_tau_r, _s23_tau_2
@@ -259,16 +263,30 @@ def _run_stage23(
     _s23_threads_per_proc = threads_per_proc
     _s23_mem_thresh       = mem_thresh
 
-    writer = Stage3ShardedWriter(packed_dir, shard_size=shard_size)
+    # Resume: detect shards already written in a previous interrupted run.
+    writer = Stage3ShardedWriter(packed_dir, shard_size=shard_size, resume=True)
+    done_set = writer.done_mol_ids()
+    if done_set:
+        mol_ids_todo = [m for m in mol_ids if m not in done_set]
+        print(f"  Resume detected: {len(done_set)} mol already written "
+              f"({writer._shard_idx} shard(s)), {len(mol_ids_todo)} remaining.")
+    else:
+        mol_ids_todo = mol_ids
+
+    if not mol_ids_todo:
+        print("  All molecules already processed — nothing to do.")
+        writer.finalize()
+        return
+
     counts:     Dict[str, int] = defaultdict(int)
     proc_times: List[float]    = []
 
     ctx = mp.get_context("fork" if sys.platform != "win32" else "spawn")
     with ctx.Pool(processes=workers) as pool:
-        with tqdm(total=len(mol_ids), desc="Stage 2+3", unit="mol",
+        with tqdm(total=len(mol_ids_todo), desc="Stage 2+3", unit="mol",
                   dynamic_ncols=True) as pbar:
             for mol_id, status, elapsed, sample in pool.imap_unordered(
-                _s23_worker, mol_ids, chunksize=chunksize
+                _s23_worker, mol_ids_todo, chunksize=chunksize
             ):
                 key = "ok" if status == "ok" else "error"
                 counts[key] += 1

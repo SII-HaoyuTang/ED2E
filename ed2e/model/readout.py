@@ -38,7 +38,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ed2e.data.stage3_local import Stage3TensorBatch
-from ed2e.model.stage3_local import DualStreamState, _MLP, _scatter_add, _segment_softmax
+from ed2e.model.stage3_local import DualStreamState, _MLP, _safe_norm, _scatter_add, _segment_softmax
 
 _EPS = 1e-8
 
@@ -118,7 +118,7 @@ class MultiHeadChartReadout(nn.Module):
         lev_emb  = self.level_emb(level_id)                       # (A, 8)
 
         # ||vector|| across last dim (equivariant norm)
-        v_norm = p_new.vector.norm(dim=-1)                        # (A, vector_dim)
+        v_norm = _safe_norm(p_new.vector)                        # (A, vector_dim)
 
         h_a = torch.cat([p_new.scalar, v_norm, lev_emb], dim=-1) # (A, 80)
         H_a = self.chart_enc(h_a)                                 # (A, td)

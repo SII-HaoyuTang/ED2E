@@ -21,6 +21,7 @@ from ed2e.model.stage3_local import (
     DualStreamState,
     _MLP,
     _rotate_vectors,
+    _safe_norm,
     _scatter_add,
     _scatter_mean,
     _segment_softmax,
@@ -107,7 +108,7 @@ class OverlapContextEncoder(nn.Module):
         device = jac.device
 
         h_s = local_state_final.scalar[pairs[:, 0]]              # (S, 64)
-        h_v_norm = local_state_final.vector[pairs[:, 0]].norm(dim=-1)  # (S, 8)
+        h_v_norm = _safe_norm(local_state_final.vector[pairs[:, 0]])  # (S, 8)
 
         counts  = ptr[1:] - ptr[:-1]                              # (E_ov,)
         seg_idx = torch.repeat_interleave(
@@ -195,15 +196,17 @@ class IntraLevelBlock(nn.Module):
                 p_a_in_ref.flatten(1),                            # (A, 16)
                 p_ref_in_ref.flatten(1),                          # (A, 16)
                 diff_in_ref.flatten(1),                           # (A, 16)
-                p_mid.vector.norm(dim=-1),                        # (A,  8)
-                p_mid.vector[ref_idx].norm(dim=-1),               # (A,  8)
+                _safe_norm(p_mid.vector),                        # (A,  8)
+                _safe_norm(p_mid.vector[ref_idx]),               # (A,  8)
                 (p_a_in_ref * p_ref_in_ref).sum(dim=-1),          # (A,  8)
             ],
             dim=-1,
         )                                                          # (A, 72)
 
+        geom_intra = intra_static["intra_geom_static"]
+        g_scale = geom_intra.abs().amax(dim=-1, keepdim=True).clamp_min(1.0)
         F_tilde = self.es_encoder(
-            intra_static["intra_geom_static"], scalar_es, vec_es
+            geom_intra / g_scale, scalar_es, vec_es
         )                                                          # (A, 96)
 
         # Step 3: main messages
@@ -257,7 +260,7 @@ class IntraLevelBlock(nn.Module):
 
         # Step 6: update
         delta_s = self.mlp_update_s(
-            torch.cat([p_mid.scalar, m_a_s, m_a_v.norm(dim=-1)], dim=-1)
+            torch.cat([p_mid.scalar, m_a_s, _safe_norm(m_a_v)], dim=-1)
         )                                                          # (A, 64)
         p_bar_s = self.scalar_update_norm(p_mid.scalar + delta_s)
 

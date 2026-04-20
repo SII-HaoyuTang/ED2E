@@ -18,7 +18,7 @@
 ## 在 B-Block 中的位置
 
 ```
-[T_inter ∘ T_intra ∘ T_chart_encode ∘ (T_local_msg)³ ∘ T_init] × K
+[T_inter ∘ T_intra ∘ (T_chart_encode ∘ T_local_msg) × num_local_steps ∘ T_chart_encode ∘ T_init] × K
                                                                     ↓
                                               MultiHeadChartReadout (cross-attn)
                                                                     ↓
@@ -36,28 +36,35 @@
 #### 数据流
 
 ```
-batch (Stage3TensorBatch)
-  → FCLCLocalBlock(batch, shared_state=shared_state)
-      → node_state_shared_next (N, 64+8×2)   ← 传给下一轮 T_init
-      → local_state_final      (N_M, ...)     ← 节点状态，供 overlap ctx
-      → p_next_local           (A, 64+8×2)   ← chart 状态（T_chart_encode 输出）
-  → IntraLevelBlock(p_next_local, local_state_final, batch, intra_static)
-      → p_bar  (A, 64+8×2)
-  → InterLevelBlock(p_bar, batch, inter_static)
-      → p_new  (A, 64+8×2)
+ED2EBBlockStack.forward(batch):
+  shared_state = _initialize_shared_state(batch)   # 原始特征嵌入，仅调用一次
+  p_prev = None
+  for block in blocks:
+    out3 = FCLCLocalBlock(batch, shared_state=shared_state, p_prev=p_prev)
+        → node_state_shared_next (N, 64+8×2)   ← 传给下一轮 T_init
+        → local_state_final      (N_M, ...)     ← 节点状态，供 overlap ctx
+        → p_next_local           (A, 64+8×2)   ← chart 状态
+    p_bar = IntraLevelBlock(p_next_local, local_state_final, batch, intra_static)
+        → p_bar  (A, 64+8×2)
+    p_new = InterLevelBlock(p_bar, batch, inter_static)
+        → p_new  (A, 64+8×2)
+    shared_state = node_state_shared_next   # 节点状态跨轮传递
+    p_prev = p_new                          # chart 状态跨轮传递
 ```
 
-`intra_static` 和 `inter_static` 在 `ED2EBBlockStack.forward()` 中各预计算一次，在所有 K 轮 B-block 之间复用（静态几何，不随迭代改变）。
+`intra_static` 和 `inter_static` 在循环前各预计算一次，在所有 K 轮复用（静态几何）。
 
-#### `shared_state` 传递规则
+`ExplicitStructureEncoder`（ES → 调制特征）在 `ED2EBBlockStack` 中只实例化一份，所有 K 个 BBlock 共享同一套权重。
 
-| 轮次 | 输入 `shared_state` | 输出 `node_state_shared_next` |
-|------|--------------------|-----------------------------|
-| k=0 | `None`（FCLCLocalBlock 内部初始化） | (N, 64) + (N, 8, 2) |
-| k=1 | 上轮 `node_state_shared_next` | 同上 |
-| k=K-1 | 同上 | 丢弃（只用 `p_new`） |
+#### `shared_state` 和 `p_prev` 传递规则
 
-> **注**：`shared_state` 是 per-**NODE**（形状 (N, ...)），FCLCLocalBlock 内部通过 `membership[:, 1]`（node 索引）将其映射到对应 chart。`FCLCLocalBlock.forward()` 中 `shared_state` 是 keyword-only 参数，调用时必须写 `shared_state=...`。
+| 轮次 | 输入 `shared_state` | 输入 `p_prev` | 输出 `node_state_shared_next` |
+|------|--------------------|--------------|-----------------------------|
+| k=0 | `ED2EBBlockStack._initialize_shared_state()` 的输出 | `None` | (N, 64) + (N, 8, 2) |
+| k=1 | 上轮 `node_state_shared_next` | 上轮 `p_new` | 同上 |
+| k=K-1 | 同上 | 同上 | 丢弃（只取 `p_new`） |
+
+> **注**：`shared_state` 是 per-**NODE**（形状 (N, ...)），初始化由 `ED2EBBlockStack._initialize_shared_state()` 完成（含 `shared_scalar_in` 和 `shared_vector_in` 两个 MLP），不在 `FCLCLocalBlock` 内部初始化。`p_prev` 非 None 时，其值以残差方式叠加到首次 `encode_structure` 的输出上，作为 chart 状态的起点。
 
 #### Config
 
@@ -68,7 +75,10 @@ class BBlockConfig:
     local_cfg:   Stage3LocalConfig = field(default_factory=Stage3LocalConfig)
     intra_cfg:   Stage4IntraConfig = field(default_factory=Stage4IntraConfig)
     inter_cfg:   Stage5InterConfig = field(default_factory=Stage5InterConfig)
+    use_gradient_checkpointing: bool = True   # 训练时重算 BBlock 激活以节省 ~35% 显存
 ```
+
+`use_gradient_checkpointing=True` 时，`ED2EBBlockStack.forward()` 在训练模式下用 `torch.utils.checkpoint`（`use_reentrant=False`）包装每个 BBlock，以约 10% 额外计算换取 ~35% 显存节省，可在相同显存下将 per-GPU batch size 翻倍。推理时自动关闭（`self.training == False`）。
 
 ---
 
@@ -345,15 +355,43 @@ python scripts/analyze_preprocessing.py \
 
 ### 文件：`scripts/train.py`
 
+支持单卡与多卡 DDP 两种启动方式，自动检测 `LOCAL_RANK` 环境变量。
+
+#### 单卡训练
+
 ```bash
 python scripts/train.py \
     --data-dir  data/ed_energy_5w \
     --csv-path  data/ed_energy_5w/raw/ed_energy_5w.csv \
     --out-dir   runs/stage6_k3 \
     --num-bblocks 3 --batch-size 8 --epochs 100 --device cuda
+```
 
-# 断点续训
-python scripts/train.py ... --resume runs/stage6_k3/last.pt
+#### 多卡 DDP（torchrun）
+
+```bash
+torchrun --nproc_per_node=8 scripts/train.py \
+    --data-dir  data/ed_energy_5w \
+    --csv-path  data/ed_energy_5w/raw/ed_energy_5w.csv \
+    --out-dir   runs/stage6_ddp \
+    --num-bblocks 3 --batch-size 8 --grad-accum 2 \
+    --epochs 100 --num-workers 4
+
+# 等效 batch = batch_size × num_gpus × grad_accum = 8×8×2 = 128
+```
+
+#### 断点续训
+
+```bash
+torchrun --nproc_per_node=8 scripts/train.py ... --resume runs/stage6_ddp/last.pt
+```
+
+#### 启用 W&B 监控
+
+```bash
+torchrun ... \
+    --wandb --wandb-project ed2e --wandb-run-name ddp_k3_run1 \
+    --wandb-entity <your-entity>
 ```
 
 #### 关键设计
@@ -365,15 +403,47 @@ python scripts/train.py ... --resume runs/stage6_k3/last.pt
 | 损失函数 | 各目标 Huber loss（δ=1.0）取均值 |
 | 优化器 | AdamW（lr=1e-3，weight_decay=1e-4） |
 | 调度器 | CosineAnnealingLR（T_max=epochs） |
-| 梯度裁剪 | 不做（初版） |
 | 验证指标 | per-target MAE（反归一化，单位 Hartree） |
+| **精度** | **bf16 AMP（默认开启），H200/A100 推荐；`--no-amp` 可禁用** |
+| **梯度累积** | **`--grad-accum N`，等效放大逻辑 batch** |
+| **显存优化** | **Gradient Checkpointing（BBlockConfig 默认开启）** |
+| **分布式** | **DDP + NCCL，torchrun 自动检测多卡** |
+| **数据加载** | **pin_memory=True + non_blocking H2D 传输；persistent_workers** |
+| **矩阵乘** | **TF32 默认启用（H200/Ampere+）** |
+
+#### 新增 CLI 参数
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--grad-accum N` | `1` | 梯度累积步数；等效 batch = batch_size × GPUs × N |
+| `--no-amp` | — | 禁用 bf16 AMP（默认开启） |
+| `--num-workers` | `4` | 每进程 DataLoader workers |
+
+#### W&B 参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--wandb` | — | 启用 Weights & Biases 日志（需安装 `pip install wandb`） |
+| `--wandb-project` | `ed2e` | W&B 项目名 |
+| `--wandb-entity` | — | W&B 团队/用户名，留空使用默认 |
+| `--wandb-run-name` | `out-dir` 末段 | Run 名称 |
+| `--wandb-tags` | — | 空格分隔的标签列表 |
+
+W&B 额外记录：`grad_accum`、`effective_batch`、`amp`、`grad_checkpointing`、`world_size`。
+
+#### DDP 注意事项
+
+- Checkpoint 和日志只在 **rank 0** 进程执行
+- Validation 只在 **rank 0** 进程上运行（避免重复评估）
+- `DistributedSampler.set_epoch(epoch)` 在每个 epoch 开始时调用，保证各卡 shuffle 不同
+- `model.no_sync()` 在梯度累积的非最后一步跳过 allreduce，节省通信开销
 
 #### Checkpoint 格式
 
 ```python
 {
     "config":     ED2EConfig,          # dataclass
-    "state_dict": model.state_dict(),
+    "state_dict": model.state_dict(),  # raw_model（非 DDP 包装）的权重
     "norm_mean":  np.ndarray (6,),     # 训练集均值
     "norm_std":   np.ndarray (6,),
     "epoch":      int,
@@ -458,12 +528,20 @@ python scripts/smoke_stage6_forward.py \
     --packed-dir data/ed_energy_5w/packed_stage3 \
     --n-mols 4 --device cpu --num-bblocks 1
 
-# 3. 训练
+# 3. 训练（单卡）
 python scripts/train.py \
     --data-dir data/ed_energy_5w \
     --csv-path data/ed_energy_5w/raw/ed_energy_5w.csv \
     --out-dir  runs/stage6_k3 \
     --num-bblocks 3 --batch-size 8 --epochs 100 --device cuda
+
+# 3b. 训练（8× H200 DDP）
+torchrun --nproc_per_node=8 scripts/train.py \
+    --data-dir data/ed_energy_5w \
+    --csv-path data/ed_energy_5w/raw/ed_energy_5w.csv \
+    --out-dir  runs/stage6_ddp \
+    --num-bblocks 3 --batch-size 8 --grad-accum 2 \
+    --epochs 100 --num-workers 4
 
 # 4. Attention 可视化
 python scripts/visualize_attention.py \
@@ -474,7 +552,38 @@ python scripts/visualize_attention.py \
 
 ---
 
-## 十二、参数规模参考
+## 十三、数值稳定性
+
+物理特征（∇_M H、‖∇ρ‖ 等）对大分子可达 1e7+ 量级，直接进入线性层 + LayerNorm 会导致方差坍塌 → NaN。当前已在以下位置插入 per-sample 最大值归一化：
+
+| 位置 | 张量 | 归一化方式 |
+|------|------|-----------|
+| `bblock.py` `_initialize_shared_state` | `node_scalar_raw` (N,5) | `/ amax(dim=-1).clamp_min(1)` |
+| `bblock.py` `_initialize_shared_state` | `node_vector_raw` (N,2,3) | `/ amax(dim=(-2,-1)).clamp_min(1)` |
+| `stage3_local.py` `encode_structure` | `chart_es_geom_static` (A,53) | `/ amax(dim=-1).clamp_min(1)` |
+| `stage3_local.py` `LocalMessagePassingLayer` | `local_edge_attr` (E,6) | `/ amax(dim=-1).clamp_min(1)` |
+| `stage4_intra.py` `IntraLevelBlock` | `intra_geom_static` (A,7) | `/ amax(dim=-1).clamp_min(1)` |
+| `stage5_inter.py` `InterLevelBlock` | `inter_level_edge_attr` (E,7) | `/ amax(dim=-1).clamp_min(1)` |
+
+所有 `.norm(dim=-1)` 调用（12 处，分布于 stage3/4/5 和 readout）已替换为 `_safe_norm()`（在 sqrt 内部加 ε，防止零模长处梯度为 NaN）：
+
+```python
+def _safe_norm(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    return (x.pow(2).sum(dim=dim) + 1e-8).sqrt()
+```
+
+训练脚本还额外提供：
+- 输入批次 NaN/Inf 检测（跳过问题批次）
+- loss NaN/Inf 检测（跳过梯度步）
+- 梯度 NaN/Inf 检测（跳过 optimizer.step）
+
+诊断脚本：
+
+```bash
+python scripts/debug_nan_forward.py \
+    --packed-dir data/ed_energy_5w/packed_stage3 \
+    --mol-ids 1370746 2352995 --device cpu --num-bblocks 1
+```
 
 默认配置（K=3，H=4，token_dim=96）：
 

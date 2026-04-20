@@ -685,11 +685,16 @@ def build_stage3_sample(
     local_coords = np.concatenate(local_coords_list, axis=0).astype(np.float32)
     quadrant = np.concatenate(quadrant_list, axis=0).astype(np.int64)
 
-    compat = np.exp(-membership_sr).astype(np.float32)
-    membership_weight = np.zeros_like(compat)
     node_ids = chart_membership[:, 1]
-    denom = np.bincount(node_ids, weights=compat, minlength=len(node_xyz)).astype(np.float32)
-    membership_weight = compat / np.maximum(denom[node_ids], _EPS)
+    # Compute membership weights: softmax(-sr) per node, in float64 to avoid
+    # float32 underflow when sr is large (which caused weights to silently collapse
+    # to 0 for ~45% of molecules in the original float32 implementation).
+    sr_f64 = membership_sr.astype(np.float64)
+    sr_min = np.full(len(node_xyz), np.inf, dtype=np.float64)
+    np.minimum.at(sr_min, node_ids, sr_f64)           # per-node minimum sr
+    shifted = np.exp(-(sr_f64 - sr_min[node_ids]))    # in [0, 1]; most-compatible = 1
+    denom = np.bincount(node_ids, weights=shifted, minlength=len(node_xyz))
+    membership_weight = (shifted / np.maximum(denom[node_ids], 1e-30)).astype(np.float32)
 
     chart_results: List[_ChartStaticResult] = []
     if inner_threads > 1 and len(chart_jobs) > 1:
