@@ -74,7 +74,7 @@ def _segment_softmax(logits: torch.Tensor, index: torch.Tensor, dim_size: int) -
         return logits
     max_per_dst = _scatter_max_1d(logits, index, dim_size)
     exp = torch.exp(logits - max_per_dst[index])
-    denom = logits.new_zeros((dim_size,))
+    denom = exp.new_zeros((dim_size,))   # use exp's dtype to survive AMP bf16↔fp32 upcasting
     denom.scatter_add_(0, index, exp)
     return exp / (denom[index] + _EPS)
 
@@ -132,12 +132,30 @@ class ExplicitStructureEncoder(nn.Module):
         scalar_es: torch.Tensor,
         vector_es: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
+        A = geom_static.shape[0]
+        # Guard: empty batch (A=0) — return zero tensors with correct shapes.
+        if A == 0:
+            sd, vd, td = self.cfg.scalar_dim, self.cfg.vector_dim, self.cfg.token_dim
+            z = geom_static.new_zeros
+            return {
+                "mod_scalar":    z((0, sd)),
+                "chart_scalar":  z((0, sd)),
+                "mod_vector":    z((0, vd, 2)),
+                "chart_vector":  z((0, vd, 2)),
+                "token_summary": z((0, td)),
+            }
         tok_g = self.enc_g(geom_static)
         tok_s = self.enc_s(scalar_es)
         tok_v = self.enc_v(vector_es)
         tokens = torch.stack([tok_g, tok_s, tok_v], dim=1)
         tokens = tokens + self.type_embedding.unsqueeze(0)
-        attn_out, _ = self.attn(tokens, tokens, tokens, need_weights=False)
+        # Flash Attention and mem-efficient attention both require seq_len >= 8 block tiles
+        # and head_dim to be a power of 2.  With seq=3 and head_dim=24 both fail with
+        # "invalid configuration argument".  Force the pure-math backend instead.
+        with torch.backends.cuda.sdp_kernel(
+            enable_flash=False, enable_math=True, enable_mem_efficient=False
+        ):
+            attn_out, _ = self.attn(tokens, tokens, tokens, need_weights=False)
         tokens = self.token_norm(tokens + attn_out)
         pooled = self.fuse_norm(tokens.mean(dim=1))
 

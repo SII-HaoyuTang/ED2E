@@ -406,17 +406,21 @@ torchrun ... \
 | 验证指标 | per-target MAE（反归一化，单位 Hartree） |
 | **精度** | **bf16 AMP（默认开启），H200/A100 推荐；`--no-amp` 可禁用** |
 | **梯度累积** | **`--grad-accum N`，等效放大逻辑 batch** |
-| **显存优化** | **Gradient Checkpointing（BBlockConfig 默认开启）** |
-| **分布式** | **DDP + NCCL，torchrun 自动检测多卡** |
+| **显存优化** | **Gradient Checkpointing（默认开启）；`--no-grad-checkpointing` 可禁用（省 ~10-15% 计算，多用 ~35% 显存）** |
+| **分布式** | **DDP + NCCL，torchrun 自动检测多卡；`find_unused_parameters=True`（intra/inter 空边时 early return，参数条件性使用）** |
 | **数据加载** | **pin_memory=True + non_blocking H2D 传输；persistent_workers** |
 | **矩阵乘** | **TF32 默认启用（H200/Ampere+）** |
+| **算子融合** | **`--compile` 启用 torch.compile(dynamic=True)，约 10-30% 加速，首次启动多 ~2 分钟编译** |
+| **NaN 检测** | **前 3 epoch 每 batch 检测；之后每 200 步检测一次（避免 GPU-CPU 同步阻断流水线）** |
 
-#### 新增 CLI 参数
+#### CLI 参数
 
 | 参数 | 默认 | 说明 |
 |------|------|------|
 | `--grad-accum N` | `1` | 梯度累积步数；等效 batch = batch_size × GPUs × N |
 | `--no-amp` | — | 禁用 bf16 AMP（默认开启） |
+| `--no-grad-checkpointing` | — | 禁用梯度 checkpointing（省计算，多用显存；GPU 内存 < 85% 时推荐） |
+| `--compile` | — | 启用 torch.compile(dynamic=True) 算子融合 |
 | `--num-workers` | `4` | 每进程 DataLoader workers |
 
 #### W&B 参数
@@ -424,12 +428,19 @@ torchrun ... \
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--wandb` | — | 启用 Weights & Biases 日志（需安装 `pip install wandb`） |
+| `--wandb-offline` | — | 离线模式：日志写入 `<out-dir>/wandb/`，不需要网络连接 |
 | `--wandb-project` | `ed2e` | W&B 项目名 |
 | `--wandb-entity` | — | W&B 团队/用户名，留空使用默认 |
 | `--wandb-run-name` | `out-dir` 末段 | Run 名称 |
 | `--wandb-tags` | — | 空格分隔的标签列表 |
 
-W&B 额外记录：`grad_accum`、`effective_batch`、`amp`、`grad_checkpointing`、`world_size`。
+离线模式：训练时加 `--wandb --wandb-offline`，日志保存在 `<out-dir>/wandb/offline-run-*/`；训练完成后有网络时运行：
+
+```bash
+wandb sync <out-dir>/wandb/offline-run-*
+```
+
+W&B 额外记录：`grad_accum`、`effective_batch`、`amp`、`grad_checkpointing`、`torch_compile`、`world_size`。
 
 #### DDP 注意事项
 
@@ -437,6 +448,7 @@ W&B 额外记录：`grad_accum`、`effective_batch`、`amp`、`grad_checkpointin
 - Validation 只在 **rank 0** 进程上运行（避免重复评估）
 - `DistributedSampler.set_epoch(epoch)` 在每个 epoch 开始时调用，保证各卡 shuffle 不同
 - `model.no_sync()` 在梯度累积的非最后一步跳过 allreduce，节省通信开销
+- `find_unused_parameters=True`：IntraLevelBlock / InterLevelBlock 在空边时 early return，导致对应参数条件性参与 forward。dummy pass 方案在 gradient checkpointing + `no_sync()` 组合下无法可靠触发 DDP hook，故保持 `True`（约 2-5% 额外开销）
 
 #### Checkpoint 格式
 
@@ -595,3 +607,42 @@ python scripts/debug_nan_forward.py \
 | MultiHeadChartReadout | ~0.1M |
 | EnergyHeads × 6 | ~0.07M |
 | **合计** | **~2.7M** |
+
+---
+
+## 十四、性能调优指南
+
+### GPU 利用率 ~100%、显存 ~60% 时的优化路径
+
+| 优先级 | 措施 | 预期收益 | 显存变化 | 备注 |
+|--------|------|---------|---------|------|
+| ① | 降频 NaN 检测（前 3 epoch + 每 200 步） | 5–15% | 无 | 已内置，无需额外参数 |
+| ② | 关闭梯度 Checkpointing | 10–15% | +35%（~60%→~82%） | 加 `--no-grad-checkpointing` |
+| ③ | `find_unused_parameters=False` | 2–5% | 无 | 已默认，空边 dummy pass 保证梯度 |
+| ④ | torch.compile | 10–30% | 无 | 加 `--compile`；首次启动多 ~2 分钟 |
+
+### 推荐启动命令（8× H200，最大性能）
+
+```bash
+torchrun --nproc_per_node=8 scripts/train.py \
+    --data-dir  data/ed_energy_5w \
+    --csv-path  data/ed_energy_5w/raw/ed_energy_5w.csv \
+    --out-dir   runs/ed2e_ddp \
+    --num-bblocks 3 --batch-size 32 --grad-accum 1 \
+    --epochs 100 --num-workers 4 \
+    --no-grad-checkpointing --compile \
+    --wandb --wandb-project ed2e --wandb-offline
+```
+
+等效 batch = 32 × 8 = 256。
+
+### CUDA attention 注意事项
+
+`ExplicitStructureEncoder`（stage3）和 `ExplicitStructureEncoderIntra`（stage4）均做 **3-token 自注意力**，存在两个限制：
+
+1. `seq_len=3` 低于 Flash Attention / mem-efficient CUDA kernel 的最小 block tile（≥ 8）
+2. `head_dim = token_dim / token_heads = 24`，不在 Flash Attention 支持的标准值（16/32/64/128）内
+
+当 `batch_size` 较大时，chart 数 `A` 增大，`A × num_heads` 可能超出 CUDA grid.y 上限（65535），触发 `cudaErrorInvalidConfiguration`。
+
+**解决方案**：两处注意力调用均已加 `sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=False)`，强制走纯 math 路径，无 CUDA grid 限制。

@@ -48,6 +48,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch._dynamo
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
@@ -258,6 +259,14 @@ def _parse_args() -> argparse.Namespace:
     # precision / memory
     p.add_argument("--no-amp",  action="store_true",
                    help="Disable bfloat16 AMP (default: AMP enabled on CUDA)")
+    p.add_argument("--no-grad-checkpointing", action="store_true",
+                   help="Disable gradient checkpointing (saves ~10-15%% compute, "
+                        "uses ~35%% more memory; recommended when GPU memory < 85%%)")
+
+    # torch.compile
+    p.add_argument("--compile", action="store_true",
+                   help="Wrap model with torch.compile(dynamic=True) for kernel fusion "
+                        "(10-30%% speedup; adds ~2 min compile time at startup)")
 
     # misc
     p.add_argument("--device",   default="cuda" if torch.cuda.is_available() else "cpu")
@@ -268,6 +277,9 @@ def _parse_args() -> argparse.Namespace:
 
     # wandb
     p.add_argument("--wandb",         action="store_true")
+    p.add_argument("--wandb-offline", action="store_true",
+                   help="Log to local disk only (wandb offline mode); sync later with "
+                        "`wandb sync <out-dir>/wandb/offline-run-*`")
     p.add_argument("--wandb-project", default="ed2e")
     p.add_argument("--wandb-entity",  default=None)
     p.add_argument("--wandb-run-name", default=None)
@@ -370,7 +382,10 @@ def main() -> None:
 
     # ── Model ─────────────────────────────────────────────────────────────────
     cfg = ED2EConfig(
-        bblock=BBlockConfig(num_bblocks=args.num_bblocks),
+        bblock=BBlockConfig(
+            num_bblocks=args.num_bblocks,
+            use_gradient_checkpointing=not args.no_grad_checkpointing,
+        ),
         readout=ReadoutConfig(num_heads=args.num_heads),
         energy_head_hidden=args.head_hidden,
         energy_dropout=args.dropout,
@@ -393,10 +408,20 @@ def main() -> None:
     # Wrap with DDP after moving to device
     if is_ddp:
         model = DDP(raw_model, device_ids=[local_rank],
-                    find_unused_parameters=False,
+                    find_unused_parameters=True,   # intra/inter blocks skip empty-edge batches
                     gradient_as_bucket_view=True)
     else:
         model = raw_model
+
+    # Optional: torch.compile for kernel fusion (10-30% speedup; ~2 min compile overhead)
+    if args.compile:
+        if is_main:
+            print("torch.compile enabled — compiling model (dynamic=True) …")
+        # Triton's atomic_add does not support bf16; suppress compilation errors for
+        # affected subgraphs (scatter_add_ etc.) so they fall back to eager mode.
+        # Other subgraphs that can be compiled will still be fused.
+        torch._dynamo.config.suppress_errors = True
+        model = torch.compile(model, dynamic=True)
 
     num_params = sum(p.numel() for p in raw_model.parameters())
     if is_main:
@@ -421,11 +446,14 @@ def main() -> None:
 
     if use_wandb:
         run_name = args.wandb_run_name or os.path.basename(os.path.abspath(args.out_dir))
+        wandb_mode = "offline" if args.wandb_offline else "online"
         _wandb.init(
             project=args.wandb_project,
             entity=args.wandb_entity,
             name=run_name,
             tags=args.wandb_tags,
+            mode=wandb_mode,
+            dir=args.out_dir,   # write offline run files under out_dir/wandb/
             config={
                 "num_bblocks":         args.num_bblocks,
                 "num_heads":           args.num_heads,
@@ -439,6 +467,7 @@ def main() -> None:
                 "weight_decay":        args.weight_decay,
                 "amp":                 use_amp,
                 "grad_checkpointing":  cfg.bblock.use_gradient_checkpointing,
+                "torch_compile":       args.compile,
                 "world_size":          world_size,
                 "device":              str(device),
                 "num_params":          num_params,
@@ -473,6 +502,7 @@ def main() -> None:
 
         epoch_loss  = 0.0
         opt_steps   = 0
+        batch_count = 0
         t0          = time.perf_counter()
 
         for batch_idx, (batch, targets) in enumerate(train_loader):
@@ -480,14 +510,18 @@ def main() -> None:
             batch   = batch.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
 
-            # ── Bad-input guard ───────────────────────────────────────────────
+            # ── Bad-input guard (only during warm-up or every 200 steps) ──────
+            # isnan().any() triggers a GPU-CPU sync which stalls the async pipeline.
+            # Run only for the first 3 epochs and every 200 steps thereafter.
+            _do_nan_check = (epoch < 3) or (global_step % 200 == 0)
             bad_input = None
-            for _fname in _INPUT_FIELDS:
-                _t = getattr(batch, _fname, None)
-                if _t is not None and isinstance(_t, torch.Tensor) and _t.is_floating_point():
-                    if _t.isnan().any() or _t.isinf().any():
-                        bad_input = _fname
-                        break
+            if _do_nan_check:
+                for _fname in _INPUT_FIELDS:
+                    _t = getattr(batch, _fname, None)
+                    if _t is not None and isinstance(_t, torch.Tensor) and _t.is_floating_point():
+                        if _t.isnan().any() or _t.isinf().any():
+                            bad_input = _fname
+                            break
             if bad_input is not None:
                 if is_main:
                     print(f"  [WARN] NaN/Inf in '{bad_input}' at step={batch_idx+1} "
@@ -548,17 +582,21 @@ def main() -> None:
                 epoch_loss  += loss.detach().item() * args.grad_accum   # un-scale for logging
                 opt_steps   += 1
                 global_step += 1
+                batch_count += 1
 
                 if is_main and args.log_every > 0 and global_step % args.log_every == 0:
-                    avg_so_far = epoch_loss / opt_steps
-                    lr_now     = scheduler.get_last_lr()[0]
+                    avg_so_far   = epoch_loss / opt_steps
+                    lr_now       = scheduler.get_last_lr()[0]
+                    avg_batch_ms = (time.perf_counter() - t0) / batch_count * 1000
                     print(f"  [ep {epoch:3d} opt_step {global_step:5d}]  "
-                          f"loss={avg_so_far:.4f}  lr={lr_now:.2e}")
+                          f"loss={avg_so_far:.4f}  lr={lr_now:.2e}  "
+                          f"{avg_batch_ms:.0f}ms/batch")
                     if use_wandb:
                         _wandb.log({
-                            "train/loss_step": loss.item() * args.grad_accum,
-                            "train/loss_avg":  avg_so_far,
-                            "train/lr":        lr_now,
+                            "train/loss_step":   loss.item() * args.grad_accum,
+                            "train/loss_avg":    avg_so_far,
+                            "train/lr":          lr_now,
+                            "train/ms_per_batch": avg_batch_ms,
                         }, step=global_step)
 
         scheduler.step()

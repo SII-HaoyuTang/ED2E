@@ -129,6 +129,7 @@ class ED2EBBlockStack(nn.Module):
 
     def __init__(self, cfg: BBlockConfig) -> None:
         super().__init__()
+        self.cfg = cfg
         local_cfg = cfg.local_cfg
 
         # Raw-feature embedding — called once per forward pass (first BBlock only).

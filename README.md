@@ -493,12 +493,21 @@ torchrun --nproc_per_node=8 scripts/train.py ... --resume runs/ed2e_ddp/last.pt
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--wandb` | False | 启用 Weights & Biases（需 `pip install wandb`） |
+| `--wandb-offline` | False | 离线模式：日志写入本地磁盘，不需要网络；训练后用 `wandb sync` 上传 |
 | `--wandb-project` | `ed2e` | W&B 项目名 |
 | `--wandb-entity` | — | W&B 团队/用户名 |
 | `--wandb-run-name` | out-dir 末段 | Run 名称 |
 | `--wandb-tags` | — | 空格分隔的标签列表 |
 
-W&B 额外记录：`grad_accum`、`effective_batch`（= batch_size × world_size × grad_accum）、`amp`、`grad_checkpointing`、`world_size`。
+离线模式使用方法：
+```bash
+# 训练时记录到本地
+torchrun --nproc_per_node=8 scripts/train.py ... \
+    --wandb --wandb-offline --wandb-project ed2e
+
+# 训练完成后（有网络时）同步到 W&B 服务器
+wandb sync runs/ed2e_ddp/wandb/offline-run-*
+```
 
 **DDP 注意事项**
 

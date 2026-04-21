@@ -73,7 +73,11 @@ class ExplicitStructureEncoderIntra(nn.Module):
         tok_v = self.enc_v(vec_es)
         tokens = torch.stack([tok_g, tok_s, tok_v], dim=1)   # (A, 3, D)
         tokens = tokens + self.type_embedding.unsqueeze(0)
-        attn_out, _ = self.attn(tokens, tokens, tokens, need_weights=False)
+        # seq=3 and head_dim=24 are incompatible with Flash/mem-efficient CUDA kernels.
+        with torch.backends.cuda.sdp_kernel(
+            enable_flash=False, enable_math=True, enable_mem_efficient=False
+        ):
+            attn_out, _ = self.attn(tokens, tokens, tokens, need_weights=False)
         tokens = self.token_norm(tokens + attn_out)
         pooled = self.fuse_norm(tokens.mean(dim=1))           # (A, D)
         return self.F_tilde_head(pooled)                      # (A, D)
@@ -246,11 +250,12 @@ class IntraLevelBlock(nn.Module):
                 )
             )                                                      # (E_ov, 64)
             # autograd-safe scatter correction
+            # cast delta to m_s.dtype to survive AMP bf16↔fp32 mixing
             delta_full = torch.zeros_like(m_s)
             delta_full.scatter_add_(
                 0,
                 ov2ce.unsqueeze(-1).expand_as(delta),
-                delta,
+                delta.to(m_s.dtype),
             )
             m_s = m_s + delta_full                                # (E, 64)
 
