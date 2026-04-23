@@ -1,0 +1,58 @@
+# Default ED2E training config.
+# CLI arguments still override values from this file.
+
+paths:
+  data_dir: data/ed_energy_5w
+  csv_path: data/ed_energy_5w/raw/ed_energy_5w.csv
+  out_dir: runs/ed2e_default
+
+model:
+  num_bblocks: 3
+
+  # Shared hidden sizes used by Stage 3/4/5 and readout.
+  scalar_dim: 64
+  vector_dim: 8
+  token_dim: 96
+  token_heads: 4
+
+  # Stage 3 local message passing.
+  num_local_steps: 2
+  geom_dim: 32
+
+  # Readout.
+  level_emb_dim: 8
+  num_levels: 4
+  num_heads: 4
+
+  # Per-target energy heads.
+  head_hidden: 128
+  dropout: 0.1
+
+training:
+  batch_size: 8
+  epochs: 100
+  lr: 0.001
+  weight_decay: 0.0001
+  grad_accum: 1
+  num_workers: 4
+
+precision:
+  no_amp: false
+
+memory:
+  no_grad_checkpointing: false
+
+runtime:
+  device: cuda
+  resume: null
+  compile: false
+
+logging:
+  log_every: 50
+  wandb:
+    enabled: false
+    offline: false
+    project: ed2e
+    entity: null
+    run_name: null
+    tags: null

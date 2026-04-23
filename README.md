@@ -439,6 +439,12 @@ torchrun --nproc_per_node=8 scripts/train.py \
 # bf16 AMP 和 gradient checkpointing 默认开启
 ```
 
+也可以用仓库内默认配置启动：
+
+```bash
+python scripts/train.py --config configs/default_train.yaml
+```
+
 #### 断点续训
 
 ```bash

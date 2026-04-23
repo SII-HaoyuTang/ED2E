@@ -44,7 +44,7 @@ import os
 import sys
 import time
 from contextlib import nullcontext
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -70,6 +70,9 @@ from ed2e.data.stage3_packed import Stage3PackedDataset
 from ed2e.model.bblock import BBlockConfig
 from ed2e.model.ed2e import ED2EConfig, ED2EModel, TARGET_NAMES
 from ed2e.model.readout import ReadoutConfig
+from ed2e.model.stage3_local import Stage3LocalConfig
+from ed2e.model.stage4_intra import Stage4IntraConfig
+from ed2e.model.stage5_inter import Stage5InterConfig
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -227,20 +230,135 @@ def _save_checkpoint(
 # CLI
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _load_config_file(path: str) -> Dict[str, Any]:
+    """Load a JSON/YAML config file."""
+    with open(path, "r") as f:
+        if path.endswith(".json"):
+            cfg = json.load(f)
+        elif path.endswith((".yaml", ".yml")):
+            try:
+                import yaml
+            except ImportError as exc:
+                raise ImportError(
+                    "Reading YAML config files requires PyYAML. Install with "
+                    "`python -m pip install pyyaml`, or use a JSON config file."
+                ) from exc
+            cfg = yaml.safe_load(f)
+        else:
+            raise ValueError(f"Unsupported config extension for {path!r}; use .yaml, .yml, or .json")
+    if cfg is None:
+        return {}
+    if not isinstance(cfg, dict):
+        raise ValueError(f"Config file {path!r} must contain a mapping/object at the top level")
+    return cfg
+
+
+def _lookup_nested(cfg: Dict[str, Any], *paths: str) -> Any:
+    """Return the first existing dotted config path, accepting '-' or '_' in keys."""
+    for path in paths:
+        cur: Any = cfg
+        ok = True
+        for raw_key in path.split("."):
+            if not isinstance(cur, dict):
+                ok = False
+                break
+            keys = (raw_key, raw_key.replace("-", "_"), raw_key.replace("_", "-"))
+            found = False
+            for key in keys:
+                if key in cur:
+                    cur = cur[key]
+                    found = True
+                    break
+            if not found:
+                ok = False
+                break
+        if ok:
+            return cur
+    return None
+
+
+_CONFIG_ARG_PATHS: Dict[str, Tuple[str, ...]] = {
+    # paths / runtime
+    "data_dir": ("data_dir", "paths.data_dir", "data.data_dir"),
+    "csv_path": ("csv_path", "paths.csv_path", "data.csv_path"),
+    "out_dir": ("out_dir", "paths.out_dir", "output.out_dir", "run.out_dir"),
+    "device": ("device", "runtime.device"),
+    "resume": ("resume", "runtime.resume"),
+    "log_every": ("log_every", "logging.log_every"),
+    # model
+    "num_bblocks": ("num_bblocks", "model.num_bblocks", "model.bblock.num_bblocks", "bblock.num_bblocks"),
+    "scalar_dim": ("scalar_dim", "model.scalar_dim"),
+    "vector_dim": ("vector_dim", "model.vector_dim"),
+    "token_dim": ("token_dim", "model.token_dim"),
+    "token_heads": ("token_heads", "model.token_heads"),
+    "num_local_steps": ("num_local_steps", "model.num_local_steps", "model.local.num_local_steps"),
+    "geom_dim": ("geom_dim", "model.geom_dim", "model.local.geom_dim"),
+    "level_emb_dim": ("level_emb_dim", "model.level_emb_dim", "model.readout.level_emb_dim"),
+    "num_levels": ("num_levels", "model.num_levels", "model.readout.num_levels"),
+    "num_heads": ("num_heads", "model.num_heads", "model.readout.num_heads"),
+    "head_hidden": ("head_hidden", "model.head_hidden", "model.energy_head_hidden"),
+    "dropout": ("dropout", "model.dropout", "model.energy_dropout"),
+    # training
+    "batch_size": ("batch_size", "training.batch_size"),
+    "epochs": ("epochs", "training.epochs"),
+    "lr": ("lr", "training.lr"),
+    "weight_decay": ("weight_decay", "training.weight_decay"),
+    "grad_accum": ("grad_accum", "training.grad_accum"),
+    "num_workers": ("num_workers", "training.num_workers"),
+    # precision / memory / compile
+    "no_amp": ("no_amp", "precision.no_amp"),
+    "no_grad_checkpointing": ("no_grad_checkpointing", "memory.no_grad_checkpointing"),
+    "compile": ("compile", "runtime.compile"),
+    # wandb
+    "wandb": ("wandb", "logging.wandb.enabled"),
+    "wandb_offline": ("wandb_offline", "logging.wandb.offline"),
+    "wandb_project": ("wandb_project", "logging.wandb.project"),
+    "wandb_entity": ("wandb_entity", "logging.wandb.entity"),
+    "wandb_run_name": ("wandb_run_name", "logging.wandb.run_name"),
+    "wandb_tags": ("wandb_tags", "logging.wandb.tags"),
+}
+
+
+def _defaults_from_config(path: Optional[str]) -> Dict[str, Any]:
+    if path is None:
+        return {}
+    raw = _load_config_file(path)
+    defaults: Dict[str, Any] = {"config": path}
+    for dest, paths in _CONFIG_ARG_PATHS.items():
+        val = _lookup_nested(raw, *paths)
+        if val is not None:
+            defaults[dest] = val
+    return defaults
+
+
 def _parse_args() -> argparse.Namespace:
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", default=None, help="Path to YAML/JSON training config")
+    pre_args, _ = pre.parse_known_args()
+    config_defaults = _defaults_from_config(pre_args.config)
+
     p = argparse.ArgumentParser(
         description="Train ED2EModel on EDBench energy prediction.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        parents=[pre],
     )
-    p.add_argument("--data-dir",    required=True,
+    p.add_argument("--data-dir",
                    help="Root dir containing packed_stage3/, split.json, energy_stats.json")
-    p.add_argument("--csv-path",    required=True,
+    p.add_argument("--csv-path",
                    help="Path to ed_energy_5w.csv (for energy labels)")
-    p.add_argument("--out-dir",     required=True,
+    p.add_argument("--out-dir",
                    help="Checkpoint / log output directory")
 
     # model
     p.add_argument("--num-bblocks",  type=int,   default=3)
+    p.add_argument("--scalar-dim",   type=int,   default=64)
+    p.add_argument("--vector-dim",   type=int,   default=8)
+    p.add_argument("--token-dim",    type=int,   default=96)
+    p.add_argument("--token-heads",  type=int,   default=4)
+    p.add_argument("--num-local-steps", type=int, default=2)
+    p.add_argument("--geom-dim",     type=int,   default=32)
+    p.add_argument("--level-emb-dim", type=int,  default=8)
+    p.add_argument("--num-levels",   type=int,   default=4)
     p.add_argument("--num-heads",    type=int,   default=4)
     p.add_argument("--head-hidden",  type=int,   default=128)
     p.add_argument("--dropout",      type=float, default=0.1)
@@ -284,7 +402,17 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--wandb-entity",  default=None)
     p.add_argument("--wandb-run-name", default=None)
     p.add_argument("--wandb-tags",    nargs="*", default=None)
-    return p.parse_args()
+    p.set_defaults(**config_defaults)
+    args = p.parse_args()
+
+    missing = [name for name in ("data_dir", "csv_path", "out_dir") if getattr(args, name) is None]
+    if missing:
+        p.error("missing required arguments: " + ", ".join(f"--{name.replace('_', '-')}" for name in missing))
+    if args.token_dim % args.num_heads != 0:
+        p.error(f"--token-dim ({args.token_dim}) must be divisible by --num-heads ({args.num_heads})")
+    if args.token_dim % args.token_heads != 0:
+        p.error(f"--token-dim ({args.token_dim}) must be divisible by --token-heads ({args.token_heads})")
+    return args
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -381,12 +509,41 @@ def main() -> None:
         )
 
     # ── Model ─────────────────────────────────────────────────────────────────
+    local_cfg = Stage3LocalConfig(
+        scalar_dim=args.scalar_dim,
+        vector_dim=args.vector_dim,
+        token_dim=args.token_dim,
+        token_heads=args.token_heads,
+        num_local_steps=args.num_local_steps,
+        geom_dim=args.geom_dim,
+    )
+    intra_cfg = Stage4IntraConfig(
+        scalar_dim=args.scalar_dim,
+        vector_dim=args.vector_dim,
+        token_dim=args.token_dim,
+        token_heads=args.token_heads,
+    )
+    inter_cfg = Stage5InterConfig(
+        scalar_dim=args.scalar_dim,
+        vector_dim=args.vector_dim,
+        token_dim=args.token_dim,
+    )
     cfg = ED2EConfig(
         bblock=BBlockConfig(
             num_bblocks=args.num_bblocks,
+            local_cfg=local_cfg,
+            intra_cfg=intra_cfg,
+            inter_cfg=inter_cfg,
             use_gradient_checkpointing=not args.no_grad_checkpointing,
         ),
-        readout=ReadoutConfig(num_heads=args.num_heads),
+        readout=ReadoutConfig(
+            scalar_dim=args.scalar_dim,
+            vector_dim=args.vector_dim,
+            level_emb_dim=args.level_emb_dim,
+            num_levels=args.num_levels,
+            token_dim=args.token_dim,
+            num_heads=args.num_heads,
+        ),
         energy_head_hidden=args.head_hidden,
         energy_dropout=args.dropout,
     )
